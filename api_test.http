@@ -1,0 +1,120 @@
+### Tệp này sử dụng Extension "REST Client" trong VS Code.
+### Bạn có thể cài extension này, sau đó sẽ hiện nút "Send Request" ở trên mỗi API để chạy thử.
+### Nếu không có extension, bạn có thể copy URL và Body sang Postman.
+
+@baseUrl = http://localhost:8080/api
+
+### 1. Đăng ký một tài khoản mới (Mặc định là Bệnh nhân)
+# @name registerUser
+POST {{baseUrl}}/auth/register
+Content-Type: application/json
+
+{
+  "fullName": "Test Bệnh Nhân",
+  "email": "benhnhan@test.com",
+  "password": "123",
+  "phone": "0987654321"
+}
+
+### 2. Đăng nhập để lấy Token
+# @name loginUser
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+  "email": "benhnhan@test.com",
+  "password": "123"
+}
+
+### >>> COPY chuỗi "token" trả về ở trên và thay thế vào chữ "TOKEN_CUA_BAN_O_DAY" ở các request dưới.
+@token = TOKEN_CUA_BAN_O_DAY
+
+### ========================================================
+### TEST API DỊCH VỤ (SERVICES)
+### ========================================================
+
+### 3. Lấy danh sách dịch vụ (Ai cũng xem được, không cần token)
+GET {{baseUrl}}/services
+
+### 4. Thêm dịch vụ mới (LƯU Ý: Yêu cầu tài khoản Admin. Bạn cần sửa role trong DB thành admin để chạy được)
+POST {{baseUrl}}/services
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "name": "Nhổ răng khôn",
+  "description": "Nhổ răng khôn mọc lệch",
+  "price": 1000000,
+  "duration": 60,
+  "status": "active"
+}
+
+### ========================================================
+### TEST API LỊCH HẸN (APPOINTMENTS)
+### ========================================================
+
+### 5. Đặt lịch hẹn mới (Dùng token của Bệnh nhân)
+# Sửa serviceIds thành mảng các ID dịch vụ có thật trong DB của bạn
+POST {{baseUrl}}/appointments
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "appointmentDate": "2026-10-15",
+  "appointmentTime": "09:00:00",
+  "notes": "Tôi bị đau răng hàm",
+  "serviceIds": [1] 
+}
+
+### 6. Xem danh sách lịch hẹn của bản thân (Bệnh nhân)
+GET {{baseUrl}}/appointments
+Authorization: Bearer {{token}}
+
+### 7. Hủy lịch hẹn (Bệnh nhân chỉ được hủy lịch chờ)
+# Thay số 1 bằng ID lịch hẹn của bạn
+PUT {{baseUrl}}/appointments/1/status
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "status": "cancelled"
+}
+
+### ========================================================
+### TEST API HỒ SƠ BỆNH ÁN & HÓA ĐƠN
+### ========================================================
+
+### 8. Tạo Bệnh án (LƯU Ý: Cần Token của Bác sĩ và Lịch hẹn ID phải đổi trạng thái thành 'completed')
+POST {{baseUrl}}/records
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "appointmentId": 1,
+  "diagnosis": "Sâu răng số 8",
+  "prescription": "Paracetamol 500mg, sáng 1 tối 1",
+  "notes": "Nhổ răng thành công, hẹn 1 tuần sau cắt chỉ"
+}
+
+### 9. Xuất Hóa đơn (LƯU Ý: Cần Token của Admin/Staff và Lịch hẹn ID 'completed')
+# API này sẽ TỰ ĐỘNG tính tổng tiền từ các dịch vụ trong Appointment_Services
+POST {{baseUrl}}/invoices
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "appointmentId": 1,
+  "paymentMethod": "transfer"
+}
+
+### 10. Lấy danh sách hóa đơn
+GET {{baseUrl}}/invoices
+Authorization: Bearer {{token}}
+
+### ========================================================
+### TEST API CHAT
+### ========================================================
+
+### 11. Lấy lịch sử tin nhắn phòng chung
+GET {{baseUrl}}/chat/history
+Authorization: Bearer {{token}}

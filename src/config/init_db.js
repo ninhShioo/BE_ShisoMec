@@ -1,0 +1,252 @@
+const fs = require('fs');
+const path = require('path');
+const mysql = require('mysql2/promise');
+require('dotenv').config({ quiet: true });
+
+const { seedDemoData } = require('./seed_demo');
+
+const dbConfig = {
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    port: process.env.DB_PORT || 3306
+};
+
+const databaseName = process.env.DB_NAME || 'dental_clinic_db';
+
+const splitSqlStatements = (sql) => sql
+    .split(/;\s*(?:\r?\n|$)/)
+    .map((statement) => statement.trim())
+    .filter(Boolean);
+
+const runSqlFile = async (connection, filePath) => {
+    const sql = fs.readFileSync(filePath, 'utf8');
+    const statements = splitSqlStatements(sql);
+
+    for (const statement of statements) {
+        await connection.query(statement);
+    }
+};
+
+const addColumnIfMissing = async (connection, tableName, columnName, definition) => {
+    const [columns] = await connection.query(
+        `SELECT COLUMN_NAME
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+        [databaseName, tableName, columnName]
+    );
+
+    if (columns.length === 0) {
+        await connection.query(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+        console.log(`Added column ${tableName}.${columnName}`);
+    }
+};
+
+const addIndexIfMissing = async (connection, tableName, indexName, definition) => {
+    const [indexes] = await connection.query(
+        `SELECT INDEX_NAME
+         FROM INFORMATION_SCHEMA.STATISTICS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ?
+         LIMIT 1`,
+        [databaseName, tableName, indexName]
+    );
+
+    if (indexes.length === 0) {
+        await connection.query(`ALTER TABLE ${tableName} ADD ${definition}`);
+        console.log(`Added index ${tableName}.${indexName}`);
+    }
+};
+
+const addForeignKeyIfMissing = async (connection, constraintName, sql) => {
+    const [constraints] = await connection.query(
+        `SELECT CONSTRAINT_NAME
+         FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+         WHERE TABLE_SCHEMA = ? AND CONSTRAINT_NAME = ?
+         LIMIT 1`,
+        [databaseName, constraintName]
+    );
+
+    if (constraints.length === 0) {
+        await connection.query(sql);
+        console.log(`Added foreign key ${constraintName}`);
+    }
+};
+
+const runCompatibilityMigrations = async (connection) => {
+    await connection.query(`
+        CREATE TABLE IF NOT EXISTS DoctorSchedules (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            dentistId INT NOT NULL,
+            dayOfWeek TINYINT NOT NULL,
+            startTime TIME NOT NULL DEFAULT '08:00:00',
+            endTime TIME NOT NULL DEFAULT '17:00:00',
+            breakStart TIME DEFAULT '12:00:00',
+            breakEnd TIME DEFAULT '13:00:00',
+            slotIntervalMinutes INT NOT NULL DEFAULT 30,
+            isActive TINYINT(1) DEFAULT 1,
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_doctor_schedule_day (dentistId, dayOfWeek),
+            FOREIGN KEY (dentistId) REFERENCES Users(id) ON DELETE CASCADE
+        )
+    `);
+    await connection.query(`
+        CREATE TABLE IF NOT EXISTS DoctorDaysOff (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            dentistId INT NOT NULL,
+            offDate DATE NOT NULL,
+            reason VARCHAR(255),
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_doctor_day_off (dentistId, offDate),
+            FOREIGN KEY (dentistId) REFERENCES Users(id) ON DELETE CASCADE
+        )
+    `);
+    await connection.query(`
+        CREATE TABLE IF NOT EXISTS DentistChangeRequests (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            appointmentId INT NOT NULL,
+            requestedBy INT NOT NULL,
+            oldDentistId INT,
+            newDentistId INT NOT NULL,
+            status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
+            adminId INT,
+            note TEXT,
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reviewedAt TIMESTAMP NULL,
+            FOREIGN KEY (appointmentId) REFERENCES Appointments(id) ON DELETE CASCADE,
+            FOREIGN KEY (requestedBy) REFERENCES Users(id) ON DELETE CASCADE,
+            FOREIGN KEY (oldDentistId) REFERENCES Users(id) ON DELETE SET NULL,
+            FOREIGN KEY (newDentistId) REFERENCES Users(id) ON DELETE CASCADE,
+            FOREIGN KEY (adminId) REFERENCES Users(id) ON DELETE SET NULL,
+            INDEX idx_dentist_change_status (status, createdAt)
+        )
+    `);
+    await connection.query(`
+        CREATE TABLE IF NOT EXISTS AppointmentStatusHistory (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            appointmentId INT NOT NULL,
+            oldStatus VARCHAR(50),
+            newStatus VARCHAR(50) NOT NULL,
+            changedBy INT,
+            reason TEXT,
+            note TEXT,
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (appointmentId) REFERENCES Appointments(id) ON DELETE CASCADE,
+            FOREIGN KEY (changedBy) REFERENCES Users(id) ON DELETE SET NULL,
+            INDEX idx_appointment_status_history (appointmentId, createdAt)
+        )
+    `);
+
+    await addColumnIfMissing(connection, 'Services', 'image', 'VARCHAR(255) DEFAULT NULL');
+    await addColumnIfMissing(connection, 'Services', 'categoryId', 'INT DEFAULT NULL');
+    await addColumnIfMissing(connection, 'MedicalRecords', 'attachments', 'TEXT');
+    await addColumnIfMissing(connection, 'MedicalRecords', 'chiefComplaint', 'TEXT');
+    await addColumnIfMissing(connection, 'MedicalRecords', 'treatmentPlan', 'TEXT');
+    await addColumnIfMissing(connection, 'MedicalRecords', 'procedures', 'TEXT');
+    await addColumnIfMissing(connection, 'MedicalRecords', 'nextAppointmentDate', 'DATE NULL');
+    await addColumnIfMissing(connection, 'MedicalRecords', 'nextAppointmentNote', 'TEXT');
+    await addColumnIfMissing(connection, 'ChatMessages', 'readAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Promotions', 'name', "VARCHAR(150) NOT NULL DEFAULT 'Khuyến mãi'");
+    await addColumnIfMissing(connection, 'Promotions', 'description', 'TEXT');
+    await addColumnIfMissing(connection, 'Promotions', 'isActive', 'TINYINT(1) DEFAULT 1');
+    await addColumnIfMissing(connection, 'Appointments', 'confirmationReminderSentAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Appointments', 'statusChangedAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Appointments', 'checkedInAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Appointments', 'startedAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Appointments', 'completedAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Appointments', 'cancelledAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Appointments', 'noShowAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Appointments', 'cancellationReason', 'TEXT');
+    await addColumnIfMissing(connection, 'Appointments', 'statusNote', 'TEXT');
+    await addColumnIfMissing(connection, 'Appointments', 'rescheduledAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Appointments', 'rescheduleReason', 'TEXT');
+
+    await connection.query(`
+        ALTER TABLE Appointments
+        MODIFY status ENUM('pending', 'confirmed', 'arrived', 'in_progress', 'completed', 'cancelled', 'no_show') DEFAULT 'pending'
+    `);
+
+    await addForeignKeyIfMissing(
+        connection,
+        'fk_service_category',
+        'ALTER TABLE Services ADD CONSTRAINT fk_service_category FOREIGN KEY (categoryId) REFERENCES Categories(id) ON DELETE SET NULL'
+    ).catch((error) => {
+        console.warn(`Skipped fk_service_category: ${error.message}`);
+    });
+
+    await addIndexIfMissing(
+        connection,
+        'Appointments',
+        'idx_appointments_patient_slot',
+        'INDEX idx_appointments_patient_slot (patientId, appointmentDate, appointmentTime)'
+    );
+    await addIndexIfMissing(
+        connection,
+        'Appointments',
+        'idx_appointments_dentist_slot',
+        'INDEX idx_appointments_dentist_slot (dentistId, appointmentDate, appointmentTime)'
+    );
+    await addIndexIfMissing(
+        connection,
+        'Appointments',
+        'idx_appointments_status_date',
+        'INDEX idx_appointments_status_date (status, appointmentDate)'
+    );
+    await addIndexIfMissing(
+        connection,
+        'Promotions',
+        'idx_promotions_active_dates',
+        'INDEX idx_promotions_active_dates (isActive, startDate, endDate)'
+    );
+
+    await addIndexIfMissing(
+        connection,
+        'MedicalRecords',
+        'uq_medical_records_appointment',
+        'UNIQUE KEY uq_medical_records_appointment (appointmentId)'
+    ).catch((error) => {
+        console.warn(`Skipped unique MedicalRecords.appointmentId: ${error.message}`);
+    });
+
+    await addIndexIfMissing(
+        connection,
+        'Invoices',
+        'uq_invoices_appointment',
+        'UNIQUE KEY uq_invoices_appointment (appointmentId)'
+    ).catch((error) => {
+        console.warn(`Skipped unique Invoices.appointmentId: ${error.message}`);
+    });
+
+    await addIndexIfMissing(
+        connection,
+        'Reviews',
+        'uq_reviews_appointment',
+        'UNIQUE KEY uq_reviews_appointment (appointmentId)'
+    ).catch((error) => {
+        console.warn(`Skipped unique Reviews.appointmentId: ${error.message}`);
+    });
+};
+
+async function initDatabase() {
+    const connection = await mysql.createConnection(dbConfig);
+
+    try {
+        console.log('Connected to MySQL server.');
+        await connection.query(`CREATE DATABASE IF NOT EXISTS \`${databaseName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+        await connection.query(`USE \`${databaseName}\``);
+
+        const schemaPath = path.join(__dirname, '../models/schema.sql');
+        await runSqlFile(connection, schemaPath);
+        await runCompatibilityMigrations(connection);
+        await seedDemoData(connection);
+
+        console.log('Database schema and demo data are ready.');
+    } catch (error) {
+        console.error('Error initializing database:', error);
+        process.exitCode = 1;
+    } finally {
+        await connection.end();
+    }
+}
+
+initDatabase();

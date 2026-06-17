@@ -1,0 +1,39 @@
+{
+  "name": "doan1",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "init-db": "node src/config/init_db.js",
+    "db:setup": "node src/config/init_db.js",
+    "seed-users": "node src/config/seed_users.js",
+    "seed-demo": "node src/config/seed_users.js",
+    "doctor": "node scripts/preflight.js",
+    "smoke:api": "node scripts/smoke_api.js",
+    "smoke:clean": "node scripts/clean_smoke_data.js",
+    "test": "npm run smoke:api"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cloudinary": "^2.10.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.5.0",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "multer": "^2.1.1",
+    "multer-storage-cloudinary": "^4.0.0",
+    "mysql2": "^3.22.3",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}

@@ -1,0 +1,244 @@
+const pool = require('../config/database');
+const { createNotification } = require('../services/notification.service');
+
+const parseAttachments = (attachments) => {
+    if (!attachments) return null;
+
+    try {
+        if (typeof attachments === 'string') {
+            const parsed = JSON.parse(attachments);
+            return JSON.stringify(Array.isArray(parsed) ? parsed : []);
+        }
+
+        return JSON.stringify(Array.isArray(attachments) ? attachments : []);
+    } catch {
+        return JSON.stringify([]);
+    }
+};
+
+const cleanText = (value) => {
+    if (value === undefined || value === null) return null;
+    const text = String(value).trim();
+    return text || null;
+};
+
+const normalizeDate = (value) => {
+    if (!value) return null;
+    const text = String(value).slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
+};
+
+const recordAppointmentStatusHistory = async (connection, appointmentId, oldStatus, newStatus, userId, reason = null, note = null) => {
+    try {
+        await connection.query(
+            `INSERT INTO AppointmentStatusHistory
+             (appointmentId, oldStatus, newStatus, changedBy, reason, note)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [appointmentId, oldStatus || null, newStatus, userId || null, reason || null, note || null]
+        );
+    } catch (error) {
+        console.warn(`Skipped AppointmentStatusHistory insert: ${error.message}`);
+    }
+};
+
+const mapRecord = (record) => ({
+    ...record,
+    attachments: (() => {
+        try {
+            const parsed = JSON.parse(record.attachments || '[]');
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    })()
+});
+
+const medicalRecordController = {
+    createRecord: async (req, res, next) => {
+        const connection = await pool.getConnection();
+
+        try {
+            const appointmentId = Number(req.body.appointmentId);
+            const {
+                chiefComplaint,
+                diagnosis,
+                treatmentPlan,
+                procedures,
+                prescription,
+                notes,
+                nextAppointmentDate,
+                nextAppointmentNote,
+                attachments
+            } = req.body;
+
+            if (!Number.isInteger(appointmentId) || appointmentId <= 0) {
+                return res.status(400).json({ success: false, message: 'ID lịch hẹn không hợp lệ.' });
+            }
+
+            if (!cleanText(diagnosis)) {
+                return res.status(400).json({ success: false, message: 'Chẩn đoán là bắt buộc.' });
+            }
+
+            await connection.beginTransaction();
+
+            const [appointments] = await connection.query(
+                'SELECT patientId, dentistId, status FROM Appointments WHERE id = ? FOR UPDATE',
+                [appointmentId]
+            );
+            if (appointments.length === 0) {
+                await connection.rollback();
+                return res.status(404).json({ success: false, message: 'Không tìm thấy lịch hẹn.' });
+            }
+
+            const appointment = appointments[0];
+            if (!appointment.dentistId) {
+                await connection.rollback();
+                return res.status(400).json({
+                    success: false,
+                    message: 'Lịch hẹn chưa được phân công bác sĩ.'
+                });
+            }
+
+            if (req.user.role === 'dentist' && appointment.dentistId !== req.user.id) {
+                await connection.rollback();
+                return res.status(403).json({
+                    success: false,
+                    message: 'Bạn chỉ được tạo hồ sơ cho lịch hẹn do mình phụ trách.'
+                });
+            }
+
+            if (!['arrived', 'in_progress'].includes(appointment.status)) {
+                await connection.rollback();
+                return res.status(400).json({
+                    success: false,
+                    message: 'Chỉ có thể tạo hồ sơ khi khách đã check-in hoặc đang khám.'
+                });
+            }
+
+            const [existingRecords] = await connection.query(
+                'SELECT id FROM MedicalRecords WHERE appointmentId = ? LIMIT 1',
+                [appointmentId]
+            );
+            if (existingRecords.length > 0) {
+                await connection.rollback();
+                return res.status(409).json({ success: false, message: 'Lịch hẹn này đã có hồ sơ khám.' });
+            }
+
+            const normalizedNextDate = normalizeDate(nextAppointmentDate);
+
+            await connection.query(
+                `INSERT INTO MedicalRecords
+                 (appointmentId, patientId, dentistId, diagnosis, chiefComplaint, treatmentPlan, procedures,
+                  prescription, notes, nextAppointmentDate, nextAppointmentNote, attachments)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                    appointmentId,
+                    appointment.patientId,
+                    appointment.dentistId,
+                    cleanText(diagnosis),
+                    cleanText(chiefComplaint),
+                    cleanText(treatmentPlan),
+                    cleanText(procedures),
+                    cleanText(prescription),
+                    cleanText(notes),
+                    normalizedNextDate,
+                    cleanText(nextAppointmentNote),
+                    parseAttachments(attachments)
+                ]
+            );
+
+            await connection.query(
+                'UPDATE Appointments SET status = "completed", completedAt = NOW(), statusChangedAt = NOW(), statusNote = ? WHERE id = ?',
+                ['Hoàn thành sau khi lưu hồ sơ khám', appointmentId]
+            );
+            await recordAppointmentStatusHistory(
+                connection,
+                appointmentId,
+                appointment.status,
+                'completed',
+                req.user.id,
+                'Lưu hồ sơ khám',
+                cleanText(procedures) || cleanText(notes)
+            );
+
+            await createNotification(
+                connection,
+                appointment.patientId,
+                'Hồ sơ khám đã được cập nhật',
+                `Bác sĩ đã hoàn tất hồ sơ khám cho lịch hẹn #${appointmentId}.`,
+                'appointment'
+            );
+
+            await connection.commit();
+
+            res.status(201).json({
+                success: true,
+                message: 'Tạo hồ sơ khám thành công.'
+            });
+        } catch (error) {
+            await connection.rollback();
+            next(error);
+        } finally {
+            connection.release();
+        }
+    },
+
+    getRecordsByPatient: async (req, res, next) => {
+        try {
+            const targetPatientId = Number(req.params.patientId);
+
+            if (!Number.isInteger(targetPatientId) || targetPatientId <= 0) {
+                return res.status(400).json({ success: false, message: 'ID bệnh nhân không hợp lệ.' });
+            }
+
+            if (req.user.role === 'patient' && targetPatientId !== req.user.id) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Bạn chỉ được xem hồ sơ khám của chính mình.'
+                });
+            }
+
+            let query = `
+                SELECT
+                    m.id, m.appointmentId, m.diagnosis, m.chiefComplaint, m.treatmentPlan, m.procedures,
+                    m.prescription, m.notes, m.nextAppointmentDate, m.nextAppointmentNote, m.attachments,
+                    m.createdAt, m.updatedAt,
+                    a.appointmentDate, a.appointmentTime,
+                    d.fullName as dentistName,
+                    svc.serviceNames
+                FROM MedicalRecords m
+                JOIN Appointments a ON m.appointmentId = a.id
+                JOIN Users d ON m.dentistId = d.id
+                LEFT JOIN (
+                    SELECT
+                        asv.appointmentId,
+                        GROUP_CONCAT(s.name ORDER BY s.name SEPARATOR ', ') as serviceNames
+                    FROM Appointment_Services asv
+                    JOIN Services s ON asv.serviceId = s.id
+                    GROUP BY asv.appointmentId
+                ) svc ON svc.appointmentId = a.id
+                WHERE m.patientId = ?
+            `;
+            const queryParams = [targetPatientId];
+
+            if (req.user.role === 'dentist') {
+                query += ' AND m.dentistId = ?';
+                queryParams.push(req.user.id);
+            }
+
+            query += ' ORDER BY a.appointmentDate DESC, a.appointmentTime DESC, m.createdAt DESC';
+
+            const [records] = await pool.query(query, queryParams);
+
+            res.json({
+                success: true,
+                message: 'Lấy hồ sơ khám thành công.',
+                data: records.map(mapRecord)
+            });
+        } catch (error) {
+            next(error);
+        }
+    }
+};
+
+module.exports = medicalRecordController;
