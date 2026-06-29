@@ -99,8 +99,10 @@ npm run build
 - `BODY_LIMIT`: giới hạn JSON/form body, mặc định `1mb`.
 - `RATE_LIMIT_WINDOW_MS`: khung thời gian rate limit.
 - `RATE_LIMIT_MAX`: số request tối đa trong khung thời gian.
+- `GOOGLE_CLIENT_ID`: OAuth Client ID dùng xác thực đăng nhập Google.
 - `VITE_API_URL`: URL API cho frontend.
 - `VITE_SOCKET_URL`: URL socket cho frontend.
+- `VITE_GOOGLE_CLIENT_ID`: OAuth Client ID dùng hiển thị nút Google ở frontend.
 
 ## Luồng nghiệp vụ chính
 

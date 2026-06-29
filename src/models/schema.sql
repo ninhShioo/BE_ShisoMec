@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS Users (
     role ENUM('patient', 'staff', 'dentist', 'admin') DEFAULT 'patient',
     status ENUM('active', 'inactive') DEFAULT 'active',
     avatar VARCHAR(255),
+    passwordChangedAt TIMESTAMP NULL,
     createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
@@ -153,14 +154,32 @@ CREATE TABLE IF NOT EXISTS Invoices (
     id INT AUTO_INCREMENT PRIMARY KEY,
     appointmentId INT NOT NULL,
     patientId INT NOT NULL,
+    subtotalAmount DECIMAL(10, 2) NOT NULL DEFAULT 0,
+    discountAmount DECIMAL(10, 2) NOT NULL DEFAULT 0,
+    paidAmount DECIMAL(10, 2) NOT NULL DEFAULT 0,
     totalAmount DECIMAL(10, 2) NOT NULL DEFAULT 0,
-    status ENUM('unpaid', 'paid', 'cancelled') DEFAULT 'unpaid',
+    status ENUM('unpaid', 'partial', 'paid', 'cancelled') DEFAULT 'unpaid',
     paymentMethod ENUM('cash', 'card', 'transfer') DEFAULT 'cash',
+    note TEXT,
+    cancelledReason TEXT,
     createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uq_invoices_appointment (appointmentId),
     FOREIGN KEY (appointmentId) REFERENCES Appointments(id) ON DELETE CASCADE,
     FOREIGN KEY (patientId) REFERENCES Users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS InvoiceItems (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    invoiceId INT NOT NULL,
+    serviceId INT,
+    description VARCHAR(255) NOT NULL,
+    quantity INT NOT NULL DEFAULT 1,
+    unitPrice DECIMAL(10, 2) NOT NULL DEFAULT 0,
+    totalPrice DECIMAL(10, 2) NOT NULL DEFAULT 0,
+    createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (invoiceId) REFERENCES Invoices(id) ON DELETE CASCADE,
+    FOREIGN KEY (serviceId) REFERENCES Services(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS ChatMessages (
@@ -172,6 +191,19 @@ CREATE TABLE IF NOT EXISTS ChatMessages (
     createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (senderId) REFERENCES Users(id) ON DELETE CASCADE,
     FOREIGN KEY (receiverId) REFERENCES Users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS ChatConversations (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    patientId INT NOT NULL UNIQUE,
+    assignedTo INT,
+    status ENUM('new', 'open', 'closed') DEFAULT 'new',
+    closedAt TIMESTAMP NULL,
+    createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (patientId) REFERENCES Users(id) ON DELETE CASCADE,
+    FOREIGN KEY (assignedTo) REFERENCES Users(id) ON DELETE SET NULL,
+    INDEX idx_chat_conversations_status (status, updatedAt)
 );
 
 CREATE TABLE IF NOT EXISTS Roles (
@@ -221,6 +253,16 @@ CREATE TABLE IF NOT EXISTS Notifications (
     isRead BOOLEAN DEFAULT FALSE,
     type ENUM('system', 'appointment', 'payment', 'chat') DEFAULT 'system',
     createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (userId) REFERENCES Users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS NotificationPreferences (
+    userId INT PRIMARY KEY,
+    appointment TINYINT(1) DEFAULT 1,
+    payment TINYINT(1) DEFAULT 1,
+    chat TINYINT(1) DEFAULT 1,
+    systemNotice TINYINT(1) DEFAULT 1,
+    updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (userId) REFERENCES Users(id) ON DELETE CASCADE
 );
 

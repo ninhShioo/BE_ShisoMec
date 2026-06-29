@@ -97,6 +97,26 @@ const validateSettings = (settings) => {
 };
 
 const settingsController = {
+    getPublicSettings: async (req, res, next) => {
+        try {
+            const settings = await loadSettings();
+            res.json({
+                success: true,
+                message: 'Lấy thông tin phòng khám thành công.',
+                data: {
+                    clinicName: settings.clinicName,
+                    phone: settings.phone,
+                    email: settings.email,
+                    address: settings.address,
+                    openingHours: settings.openingHours,
+                    allowOnlineBooking: settings.allowOnlineBooking
+                }
+            });
+        } catch (error) {
+            next(error);
+        }
+    },
+
     getSettings: async (req, res, next) => {
         try {
             res.json({

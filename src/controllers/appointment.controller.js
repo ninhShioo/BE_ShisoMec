@@ -33,7 +33,20 @@ const getBookingLeadHours = async (connection) => {
     return Number.isFinite(value) && value >= 0 ? value : 24;
 };
 
-const getEarliestBookableDateTime = (leadHours = 24) => new Date(Date.now() + leadHours * 60 * 60 * 1000);
+const getEarliestBookableDateTime = (leadHours = 24) => {
+    const normalizedLeadHours = Number(leadHours);
+    const safeLeadHours = Number.isFinite(normalizedLeadHours) && normalizedLeadHours >= 0 ? normalizedLeadHours : 24;
+
+    if (safeLeadHours >= 24) {
+        const daysAhead = Math.ceil(safeLeadHours / 24);
+        const earliest = new Date();
+        earliest.setHours(0, 0, 0, 0);
+        earliest.setDate(earliest.getDate() + daysAhead);
+        return earliest;
+    }
+
+    return new Date(Date.now() + safeLeadHours * 60 * 60 * 1000);
+};
 
 const normalizeServiceIds = (serviceIds) => {
     if (!Array.isArray(serviceIds)) return [];
@@ -202,10 +215,10 @@ const canTransitionAppointment = (role, appt, nextStatus, userId) => {
         if (appt.dentistId !== userId) {
             return { ok: false, message: 'Chỉ được cập nhật lịch hẹn được phân công cho bạn.' };
         }
-        if (currentStatus === 'arrived' && nextStatus === 'in_progress') {
+        if (['confirmed', 'arrived'].includes(currentStatus) && nextStatus === 'in_progress') {
             return { ok: true };
         }
-        return { ok: false, message: 'Bác sĩ chỉ được bắt đầu khám khi khách đã được lễ tân check-in.' };
+        return { ok: false, message: 'Bác sĩ chỉ được bắt đầu khám với lịch đã xác nhận hoặc khách đã check-in.' };
     }
 
     if (role === 'admin' || role === 'staff') {
@@ -542,7 +555,7 @@ const appointmentController = {
         }
     },
 
-    updateAppointmentStatus: async (req, res, next) => {
+    legacyUpdateAppointmentStatus: async (req, res, next) => {
         try {
             const { id } = req.params;
             const { status } = req.body;

@@ -4,6 +4,8 @@ const settingsController = require('../controllers/settings.controller');
 const { verifyToken, checkRole } = require('../middlewares/auth.middleware');
 const logActivity = require('../middlewares/activityLogger');
 
+router.get('/public', settingsController.getPublicSettings);
+
 router.use(verifyToken, checkRole(['admin']));
 
 router.get('/', settingsController.getSettings);

@@ -169,6 +169,22 @@ const main = async () => {
         });
     });
 
+    await step('Staff checks in patient', async () => {
+        await request('PUT', `/appointments/${state.appointmentId}/status`, {
+            token: state.tokens.staff,
+            expectedStatus: 200,
+            body: { status: 'arrived', note: 'Smoke test check-in' }
+        });
+    });
+
+    await step('Dentist starts appointment', async () => {
+        await request('PUT', `/appointments/${state.appointmentId}/status`, {
+            token: state.tokens.dentist,
+            expectedStatus: 200,
+            body: { status: 'in_progress', note: 'Smoke test start' }
+        });
+    });
+
     await step('Dentist creates medical record and completes appointment', async () => {
         await request('POST', '/records', {
             token: state.tokens.dentist,

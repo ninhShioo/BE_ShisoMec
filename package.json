@@ -8,6 +8,7 @@
     "dev": "nodemon server.js",
     "init-db": "node src/config/init_db.js",
     "db:setup": "node src/config/init_db.js",
+    "db:backup": "node scripts/backup_db.js",
     "seed-users": "node src/config/seed_users.js",
     "seed-demo": "node src/config/seed_users.js",
     "doctor": "node scripts/preflight.js",

@@ -136,6 +136,45 @@ const runCompatibilityMigrations = async (connection) => {
             INDEX idx_appointment_status_history (appointmentId, createdAt)
         )
     `);
+    await connection.query(`
+        CREATE TABLE IF NOT EXISTS InvoiceItems (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            invoiceId INT NOT NULL,
+            serviceId INT,
+            description VARCHAR(255) NOT NULL,
+            quantity INT NOT NULL DEFAULT 1,
+            unitPrice DECIMAL(10, 2) NOT NULL DEFAULT 0,
+            totalPrice DECIMAL(10, 2) NOT NULL DEFAULT 0,
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (invoiceId) REFERENCES Invoices(id) ON DELETE CASCADE,
+            FOREIGN KEY (serviceId) REFERENCES Services(id) ON DELETE SET NULL
+        )
+    `);
+    await connection.query(`
+        CREATE TABLE IF NOT EXISTS ChatConversations (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            patientId INT NOT NULL UNIQUE,
+            assignedTo INT,
+            status ENUM('new', 'open', 'closed') DEFAULT 'new',
+            closedAt TIMESTAMP NULL,
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            FOREIGN KEY (patientId) REFERENCES Users(id) ON DELETE CASCADE,
+            FOREIGN KEY (assignedTo) REFERENCES Users(id) ON DELETE SET NULL,
+            INDEX idx_chat_conversations_status (status, updatedAt)
+        )
+    `);
+    await connection.query(`
+        CREATE TABLE IF NOT EXISTS NotificationPreferences (
+            userId INT PRIMARY KEY,
+            appointment TINYINT(1) DEFAULT 1,
+            payment TINYINT(1) DEFAULT 1,
+            chat TINYINT(1) DEFAULT 1,
+            systemNotice TINYINT(1) DEFAULT 1,
+            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            FOREIGN KEY (userId) REFERENCES Users(id) ON DELETE CASCADE
+        )
+    `);
 
     await addColumnIfMissing(connection, 'Services', 'image', 'VARCHAR(255) DEFAULT NULL');
     await addColumnIfMissing(connection, 'Services', 'categoryId', 'INT DEFAULT NULL');
@@ -160,10 +199,20 @@ const runCompatibilityMigrations = async (connection) => {
     await addColumnIfMissing(connection, 'Appointments', 'statusNote', 'TEXT');
     await addColumnIfMissing(connection, 'Appointments', 'rescheduledAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'Appointments', 'rescheduleReason', 'TEXT');
+    await addColumnIfMissing(connection, 'Invoices', 'subtotalAmount', 'DECIMAL(10, 2) NOT NULL DEFAULT 0');
+    await addColumnIfMissing(connection, 'Invoices', 'discountAmount', 'DECIMAL(10, 2) NOT NULL DEFAULT 0');
+    await addColumnIfMissing(connection, 'Invoices', 'paidAmount', 'DECIMAL(10, 2) NOT NULL DEFAULT 0');
+    await addColumnIfMissing(connection, 'Invoices', 'note', 'TEXT');
+    await addColumnIfMissing(connection, 'Invoices', 'cancelledReason', 'TEXT');
+    await addColumnIfMissing(connection, 'Users', 'passwordChangedAt', 'TIMESTAMP NULL');
 
     await connection.query(`
         ALTER TABLE Appointments
         MODIFY status ENUM('pending', 'confirmed', 'arrived', 'in_progress', 'completed', 'cancelled', 'no_show') DEFAULT 'pending'
+    `);
+    await connection.query(`
+        ALTER TABLE Invoices
+        MODIFY status ENUM('unpaid', 'partial', 'paid', 'cancelled') DEFAULT 'unpaid'
     `);
 
     await addForeignKeyIfMissing(

@@ -17,7 +17,7 @@ const verifyToken = async (req, res, next) => {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
         const [users] = await pool.query(
-            'SELECT id, fullName, email, role, status FROM Users WHERE id = ? LIMIT 1',
+            'SELECT id, fullName, email, role, status, passwordChangedAt FROM Users WHERE id = ? LIMIT 1',
             [decoded.id]
         );
         if (users.length === 0) {
@@ -33,6 +33,16 @@ const verifyToken = async (req, res, next) => {
                 success: false,
                 message: 'Tài khoản của bạn đã bị vô hiệu hóa.'
             });
+        }
+
+        if (user.passwordChangedAt && decoded.iat) {
+            const passwordChangedAt = Math.floor(new Date(user.passwordChangedAt).getTime() / 1000);
+            if (decoded.iat < passwordChangedAt) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Mật khẩu đã được thay đổi. Vui lòng đăng nhập lại.'
+                });
+            }
         }
 
         req.user = {

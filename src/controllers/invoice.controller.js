@@ -6,11 +6,38 @@ const validInvoicePaymentMethods = ['cash', 'card', 'transfer'];
 const invoiceReadableRoles = ['admin', 'staff', 'patient'];
 
 const toInvoicePaymentMethod = (paymentMethod) => {
-    if (paymentMethod === 'vnpay' || paymentMethod === 'momo') {
-        return 'transfer';
-    }
-
+    if (paymentMethod === 'vnpay' || paymentMethod === 'momo') return 'transfer';
     return paymentMethod;
+};
+
+const money = (value) => {
+    const amount = Number(value || 0);
+    return Number.isFinite(amount) ? Math.max(amount, 0) : 0;
+};
+
+const getInvoiceItems = async (connectionOrPool, invoiceIds) => {
+    const ids = [...new Set((Array.isArray(invoiceIds) ? invoiceIds : [invoiceIds]).map(Number).filter(Boolean))];
+    if (ids.length === 0) return new Map();
+
+    const [items] = await connectionOrPool.query(
+        `SELECT id, invoiceId, serviceId, description, quantity, unitPrice, totalPrice
+         FROM InvoiceItems
+         WHERE invoiceId IN (?)
+         ORDER BY id`,
+        [ids]
+    );
+
+    return items.reduce((map, item) => {
+        const current = map.get(item.invoiceId) || [];
+        current.push({
+            ...item,
+            quantity: Number(item.quantity || 0),
+            unitPrice: Number(item.unitPrice || 0),
+            totalPrice: Number(item.totalPrice || 0)
+        });
+        map.set(item.invoiceId, current);
+        return map;
+    }, new Map());
 };
 
 const invoiceController = {
@@ -20,6 +47,8 @@ const invoiceController = {
         try {
             const appointmentId = Number(req.body.appointmentId);
             const invoicePaymentMethod = req.body.paymentMethod || 'cash';
+            const discountAmount = money(req.body.discountAmount);
+            const note = req.body.note ? String(req.body.note).trim() : null;
 
             if (!Number.isInteger(appointmentId) || appointmentId <= 0) {
                 return res.status(400).json({ success: false, message: 'ID lịch hẹn không hợp lệ.' });
@@ -28,7 +57,7 @@ const invoiceController = {
             if (!validInvoicePaymentMethods.includes(invoicePaymentMethod)) {
                 return res.status(400).json({
                     success: false,
-                    message: 'Phương thức thanh toán khi xuất hóa đơn chỉ hỗ trợ cash, card hoặc transfer.'
+                    message: 'Phương thức khi xuất hóa đơn chỉ hỗ trợ cash, card hoặc transfer.'
                 });
             }
 
@@ -62,10 +91,11 @@ const invoiceController = {
             }
 
             const [services] = await connection.query(`
-                SELECT s.price
+                SELECT s.id, s.name, s.price
                 FROM Appointment_Services asrv
                 JOIN Services s ON asrv.serviceId = s.id
                 WHERE asrv.appointmentId = ?
+                ORDER BY s.name
             `, [appointmentId]);
 
             if (services.length === 0) {
@@ -76,16 +106,32 @@ const invoiceController = {
                 });
             }
 
-            const totalAmount = services.reduce((sum, service) => sum + Number(service.price || 0), 0);
-            if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
+            const subtotalAmount = services.reduce((sum, service) => sum + money(service.price), 0);
+            const safeDiscount = Math.min(discountAmount, subtotalAmount);
+            const totalAmount = subtotalAmount - safeDiscount;
+
+            if (totalAmount <= 0) {
                 await connection.rollback();
                 return res.status(400).json({ success: false, message: 'Tổng tiền hóa đơn không hợp lệ.' });
             }
 
             const [result] = await connection.query(
-                'INSERT INTO Invoices (appointmentId, patientId, totalAmount, paymentMethod, status) VALUES (?, ?, ?, ?, ?)',
-                [appointmentId, appointment.patientId, totalAmount, invoicePaymentMethod, 'unpaid']
+                `INSERT INTO Invoices
+                 (appointmentId, patientId, subtotalAmount, discountAmount, paidAmount, totalAmount, paymentMethod, status, note)
+                 VALUES (?, ?, ?, ?, 0, ?, ?, "unpaid", ?)`,
+                [appointmentId, appointment.patientId, subtotalAmount, safeDiscount, totalAmount, invoicePaymentMethod, note]
             );
+            const invoiceId = result.insertId;
+
+            for (const service of services) {
+                const unitPrice = money(service.price);
+                await connection.query(
+                    `INSERT INTO InvoiceItems
+                     (invoiceId, serviceId, description, quantity, unitPrice, totalPrice)
+                     VALUES (?, ?, ?, 1, ?, ?)`,
+                    [invoiceId, service.id, service.name, unitPrice, unitPrice]
+                );
+            }
 
             await connection.commit();
 
@@ -93,7 +139,7 @@ const invoiceController = {
                 pool,
                 appointment.patientId,
                 'Hóa đơn mới',
-                `Hóa đơn #${result.insertId} đã được tạo cho lịch hẹn #${appointmentId}.`,
+                `Hóa đơn #${invoiceId} đã được tạo cho lịch hẹn #${appointmentId}.`,
                 'payment'
             );
 
@@ -101,10 +147,14 @@ const invoiceController = {
                 success: true,
                 message: 'Tạo hóa đơn thành công.',
                 data: {
-                    id: result.insertId,
+                    id: invoiceId,
                     appointmentId,
                     patientId: appointment.patientId,
+                    subtotalAmount,
+                    discountAmount: safeDiscount,
+                    paidAmount: 0,
                     totalAmount,
+                    outstandingAmount: totalAmount,
                     paymentMethod: invoicePaymentMethod,
                     status: 'unpaid'
                 }
@@ -156,11 +206,29 @@ const invoiceController = {
             query += ' ORDER BY i.createdAt DESC';
 
             const [invoices] = await pool.query(query, queryParams);
+            const itemsByInvoice = await getInvoiceItems(pool, invoices.map((invoice) => invoice.id));
+
+            const data = invoices.map((invoice) => {
+                const subtotalAmount = money(invoice.subtotalAmount || invoice.totalAmount);
+                const discountAmount = money(invoice.discountAmount);
+                const paidAmount = money(invoice.paidAmount);
+                const totalAmount = money(invoice.totalAmount);
+
+                return {
+                    ...invoice,
+                    subtotalAmount,
+                    discountAmount,
+                    paidAmount,
+                    totalAmount,
+                    outstandingAmount: Math.max(totalAmount - paidAmount, 0),
+                    items: itemsByInvoice.get(invoice.id) || []
+                };
+            });
 
             res.json({
                 success: true,
                 message: 'Lấy danh sách hóa đơn thành công.',
-                data: invoices
+                data
             });
         } catch (error) {
             next(error);
@@ -173,6 +241,7 @@ const invoiceController = {
         try {
             const invoiceId = Number(req.params.id);
             const { paymentMethod = 'cash', transactionId = null } = req.body;
+            const requestedAmount = req.body.amount === undefined ? null : money(req.body.amount);
 
             if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
                 return res.status(400).json({ success: false, message: 'ID hóa đơn không hợp lệ.' });
@@ -185,7 +254,7 @@ const invoiceController = {
             await connection.beginTransaction();
 
             const [invoices] = await connection.query(
-                'SELECT id, patientId, status, totalAmount FROM Invoices WHERE id = ? FOR UPDATE',
+                'SELECT id, patientId, status, totalAmount, paidAmount FROM Invoices WHERE id = ? FOR UPDATE',
                 [invoiceId]
             );
             if (invoices.length === 0) {
@@ -196,7 +265,7 @@ const invoiceController = {
             const invoice = invoices[0];
             if (invoice.status === 'paid') {
                 await connection.rollback();
-                return res.status(400).json({ success: false, message: 'Hóa đơn này đã được thanh toán.' });
+                return res.status(400).json({ success: false, message: 'Hóa đơn này đã được thanh toán đủ.' });
             }
 
             if (invoice.status === 'cancelled') {
@@ -204,19 +273,27 @@ const invoiceController = {
                 return res.status(400).json({ success: false, message: 'Không thể thanh toán hóa đơn đã bị hủy.' });
             }
 
-            if (!Number.isFinite(Number(invoice.totalAmount)) || Number(invoice.totalAmount) <= 0) {
+            const totalAmount = money(invoice.totalAmount);
+            const paidAmount = money(invoice.paidAmount);
+            const outstandingAmount = Math.max(totalAmount - paidAmount, 0);
+            const paymentAmount = requestedAmount === null ? outstandingAmount : requestedAmount;
+
+            if (paymentAmount <= 0 || paymentAmount > outstandingAmount) {
                 await connection.rollback();
-                return res.status(400).json({ success: false, message: 'Tổng tiền hóa đơn không hợp lệ.' });
+                return res.status(400).json({ success: false, message: 'Số tiền thanh toán không hợp lệ.' });
             }
 
+            const nextPaidAmount = paidAmount + paymentAmount;
+            const nextStatus = nextPaidAmount >= totalAmount ? 'paid' : 'partial';
+
             await connection.query(
-                'UPDATE Invoices SET status = "paid", paymentMethod = ? WHERE id = ?',
-                [toInvoicePaymentMethod(paymentMethod), invoiceId]
+                'UPDATE Invoices SET status = ?, paidAmount = ?, paymentMethod = ? WHERE id = ?',
+                [nextStatus, nextPaidAmount, toInvoicePaymentMethod(paymentMethod), invoiceId]
             );
 
             const [paymentResult] = await connection.query(
                 'INSERT INTO Payments (invoiceId, amount, paymentMethod, transactionId, status) VALUES (?, ?, ?, ?, "success")',
-                [invoiceId, invoice.totalAmount, paymentMethod, transactionId]
+                [invoiceId, paymentAmount, paymentMethod, transactionId || null]
             );
 
             await connection.commit();
@@ -224,25 +301,28 @@ const invoiceController = {
             await createNotification(
                 pool,
                 invoice.patientId,
-                'Thanh toán thành công',
-                `Hóa đơn #${invoiceId} đã được thanh toán thành công.`,
+                nextStatus === 'paid' ? 'Thanh toán thành công' : 'Hóa đơn đã được thanh toán một phần',
+                `Hóa đơn #${invoiceId} đã ghi nhận thanh toán ${paymentAmount.toLocaleString('vi-VN')} đ.`,
                 'payment'
             );
             await createNotificationsForRoles(
                 pool,
                 ['admin', 'staff'],
-                'Hóa đơn đã thanh toán',
-                `Hóa đơn #${invoiceId} đã được thanh toán.`,
+                nextStatus === 'paid' ? 'Hóa đơn đã thanh toán đủ' : 'Hóa đơn thanh toán một phần',
+                `Hóa đơn #${invoiceId} đã ghi nhận thanh toán ${paymentAmount.toLocaleString('vi-VN')} đ.`,
                 'payment'
             );
 
             res.json({
                 success: true,
-                message: 'Thanh toán hóa đơn thành công.',
+                message: nextStatus === 'paid' ? 'Thanh toán hóa đơn thành công.' : 'Đã ghi nhận thanh toán một phần.',
                 data: {
                     paymentId: paymentResult.insertId,
                     invoiceId,
-                    amount: Number(invoice.totalAmount),
+                    amount: paymentAmount,
+                    paidAmount: nextPaidAmount,
+                    outstandingAmount: Math.max(totalAmount - nextPaidAmount, 0),
+                    status: nextStatus,
                     paymentMethod
                 }
             });

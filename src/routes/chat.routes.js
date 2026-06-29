@@ -7,5 +7,6 @@ router.use(verifyToken);
 
 router.get('/contacts', chatController.getContacts);
 router.get('/history', chatController.getChatHistory);
+router.put('/conversations/:patientId', chatController.updateConversation);
 
 module.exports = router;

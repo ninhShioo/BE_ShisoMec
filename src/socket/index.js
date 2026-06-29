@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const pool = require('../config/database');
 const { getCorsOrigins } = require('../config/env');
 const { setSocketServer } = require('./emitter');
+const chatController = require('../controllers/chat.controller');
 
 const initSocket = (server) => {
     const io = new Server(server, {
@@ -75,6 +76,12 @@ const initSocket = (server) => {
                     receiverId = null;
                     patientRoomId = socket.user.id;
                 }
+
+                await chatController.ensureConversation(
+                    pool,
+                    patientRoomId,
+                    socket.user.role === 'staff' || socket.user.role === 'admin' ? socket.user.id : null
+                );
 
                 const [result] = await pool.query(
                     'INSERT INTO ChatMessages (senderId, receiverId, message, readAt) VALUES (?, ?, ?, ?)',
