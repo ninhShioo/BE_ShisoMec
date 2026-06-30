@@ -6,17 +6,45 @@ const defaultSettings = {
     email: 'contact@phenikaadental.vn',
     address: 'Tòa nhà Phenikaa Tower, Hà Nội',
     openingHours: '08:00 - 20:00',
+    mapUrl: '',
+    facebookUrl: '',
+    zaloPhone: '0869 800 318',
     bookingLeadHours: 24,
     appointmentReminderHours: 4,
+    cancellationLeadHours: 6,
+    rescheduleLeadHours: 12,
+    autoNoShowMinutes: 30,
+    maxServicesPerAppointment: 4,
+    slotIntervalMinutes: 30,
     maintenanceMode: false,
     allowOnlineBooking: true,
+    allowPatientCancellation: true,
+    allowPatientReschedule: true,
+    notifyStaffOnNewAppointment: true,
+    notifyPatientOnStatusChange: true,
     theme: 'light'
 };
 
 const allowedKeys = Object.keys(defaultSettings);
-const numericKeys = ['bookingLeadHours', 'appointmentReminderHours'];
-const booleanKeys = ['maintenanceMode', 'allowOnlineBooking'];
+const numericKeys = [
+    'bookingLeadHours',
+    'appointmentReminderHours',
+    'cancellationLeadHours',
+    'rescheduleLeadHours',
+    'autoNoShowMinutes',
+    'maxServicesPerAppointment',
+    'slotIntervalMinutes'
+];
+const booleanKeys = [
+    'maintenanceMode',
+    'allowOnlineBooking',
+    'allowPatientCancellation',
+    'allowPatientReschedule',
+    'notifyStaffOnNewAppointment',
+    'notifyPatientOnStatusChange'
+];
 const stringKeys = allowedKeys.filter((key) => !numericKeys.includes(key) && !booleanKeys.includes(key));
+const validThemes = ['light', 'mint', 'ocean', 'lavender', 'rose', 'navy'];
 
 const parseSettingValue = (key, value) => {
     if (booleanKeys.includes(key)) {
@@ -26,6 +54,10 @@ const parseSettingValue = (key, value) => {
     if (numericKeys.includes(key)) {
         const numberValue = Number(value);
         return Number.isFinite(numberValue) ? numberValue : defaultSettings[key];
+    }
+
+    if (key === 'theme' && value === 'dark') {
+        return 'navy';
     }
 
     return typeof value === 'string' ? value.trim() : String(value ?? '').trim();
@@ -92,7 +124,29 @@ const validateSettings = (settings) => {
         return 'Nhắc xác nhận lịch phải từ 1 đến 24 giờ.';
     }
 
-    if (!['light', 'dark'].includes(settings.theme)) return 'Giao diện không hợp lệ.';
+    if (!Number.isInteger(settings.cancellationLeadHours) || settings.cancellationLeadHours < 0 || settings.cancellationLeadHours > 168) {
+        return 'Thời gian cho phép hủy lịch phải từ 0 đến 168 giờ.';
+    }
+
+    if (!Number.isInteger(settings.rescheduleLeadHours) || settings.rescheduleLeadHours < 0 || settings.rescheduleLeadHours > 168) {
+        return 'Thời gian cho phép đổi lịch phải từ 0 đến 168 giờ.';
+    }
+
+    if (!Number.isInteger(settings.autoNoShowMinutes) || settings.autoNoShowMinutes < 0 || settings.autoNoShowMinutes > 240) {
+        return 'Thời gian tự gợi ý không đến phải từ 0 đến 240 phút.';
+    }
+
+    if (!Number.isInteger(settings.maxServicesPerAppointment) || settings.maxServicesPerAppointment < 1 || settings.maxServicesPerAppointment > 10) {
+        return 'Số dịch vụ tối đa mỗi lịch phải từ 1 đến 10.';
+    }
+
+    if (!Number.isInteger(settings.slotIntervalMinutes) || ![15, 20, 30, 45, 60].includes(settings.slotIntervalMinutes)) {
+        return 'Bước thời gian slot không hợp lệ.';
+    }
+
+    if (settings.mapUrl && !/^https?:\/\/.+/i.test(settings.mapUrl)) return 'Link bản đồ phải bắt đầu bằng http hoặc https.';
+    if (settings.facebookUrl && !/^https?:\/\/.+/i.test(settings.facebookUrl)) return 'Link Facebook phải bắt đầu bằng http hoặc https.';
+    if (!validThemes.includes(settings.theme)) return 'Giao diện không hợp lệ.';
     return null;
 };
 
@@ -108,8 +162,13 @@ const settingsController = {
                     phone: settings.phone,
                     email: settings.email,
                     address: settings.address,
+                    mapUrl: settings.mapUrl,
+                    facebookUrl: settings.facebookUrl,
+                    zaloPhone: settings.zaloPhone,
                     openingHours: settings.openingHours,
-                    allowOnlineBooking: settings.allowOnlineBooking
+                    maintenanceMode: settings.maintenanceMode,
+                    allowOnlineBooking: settings.allowOnlineBooking,
+                    theme: settings.theme
                 }
             });
         } catch (error) {

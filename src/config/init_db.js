@@ -102,6 +102,23 @@ const runCompatibilityMigrations = async (connection) => {
         )
     `);
     await connection.query(`
+        CREATE TABLE IF NOT EXISTS DoctorDayOffRequests (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            dentistId INT NOT NULL,
+            offDate DATE NOT NULL,
+            reason VARCHAR(255),
+            status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
+            reviewedBy INT,
+            reviewNote TEXT,
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reviewedAt TIMESTAMP NULL,
+            FOREIGN KEY (dentistId) REFERENCES Users(id) ON DELETE CASCADE,
+            FOREIGN KEY (reviewedBy) REFERENCES Users(id) ON DELETE SET NULL,
+            UNIQUE KEY uq_day_off_request_pending (dentistId, offDate, status),
+            INDEX idx_day_off_request_status (status, offDate)
+        )
+    `);
+    await connection.query(`
         CREATE TABLE IF NOT EXISTS DentistChangeRequests (
             id INT AUTO_INCREMENT PRIMARY KEY,
             appointmentId INT NOT NULL,
@@ -181,7 +198,9 @@ const runCompatibilityMigrations = async (connection) => {
     await addColumnIfMissing(connection, 'MedicalRecords', 'attachments', 'TEXT');
     await addColumnIfMissing(connection, 'MedicalRecords', 'chiefComplaint', 'TEXT');
     await addColumnIfMissing(connection, 'MedicalRecords', 'treatmentPlan', 'TEXT');
+    await addColumnIfMissing(connection, 'MedicalRecords', 'treatmentSessions', 'TEXT');
     await addColumnIfMissing(connection, 'MedicalRecords', 'procedures', 'TEXT');
+    await addColumnIfMissing(connection, 'MedicalRecords', 'toothPositions', 'TEXT');
     await addColumnIfMissing(connection, 'MedicalRecords', 'nextAppointmentDate', 'DATE NULL');
     await addColumnIfMissing(connection, 'MedicalRecords', 'nextAppointmentNote', 'TEXT');
     await addColumnIfMissing(connection, 'ChatMessages', 'readAt', 'TIMESTAMP NULL');
@@ -213,6 +232,10 @@ const runCompatibilityMigrations = async (connection) => {
     await connection.query(`
         ALTER TABLE Invoices
         MODIFY status ENUM('unpaid', 'partial', 'paid', 'cancelled') DEFAULT 'unpaid'
+    `);
+    await connection.query(`
+        ALTER TABLE Notifications
+        MODIFY type ENUM('system', 'appointment', 'payment', 'chat', 'leave') DEFAULT 'system'
     `);
 
     await addForeignKeyIfMissing(

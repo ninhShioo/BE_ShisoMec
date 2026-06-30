@@ -33,6 +33,43 @@ const getBookingLeadHours = async (connection) => {
     return Number.isFinite(value) && value >= 0 ? value : 24;
 };
 
+const parseBooleanSetting = (value, fallback = false) => {
+    if (value === undefined || value === null) return fallback;
+    return value === true || value === 1 || value === '1' || value === 'true';
+};
+
+const getAppointmentPolicySettings = async (connection) => {
+    const defaults = {
+        maintenanceMode: false,
+        allowOnlineBooking: true,
+        allowPatientCancellation: true,
+        allowPatientReschedule: true,
+        notifyStaffOnNewAppointment: true,
+        notifyPatientOnStatusChange: true,
+        bookingLeadHours: 24,
+        cancellationLeadHours: 6,
+        rescheduleLeadHours: 12,
+        maxServicesPerAppointment: 4
+    };
+
+    const [rows] = await connection.query(
+        'SELECT settingKey, settingValue FROM Settings WHERE settingKey IN (?)',
+        [Object.keys(defaults)]
+    );
+
+    const settings = { ...defaults };
+    rows.forEach((row) => {
+        if (typeof defaults[row.settingKey] === 'boolean') {
+            settings[row.settingKey] = parseBooleanSetting(row.settingValue, defaults[row.settingKey]);
+        } else {
+            const numberValue = Number(row.settingValue);
+            settings[row.settingKey] = Number.isFinite(numberValue) ? numberValue : defaults[row.settingKey];
+        }
+    });
+
+    return settings;
+};
+
 const getEarliestBookableDateTime = (leadHours = 24) => {
     const normalizedLeadHours = Number(leadHours);
     const safeLeadHours = Number.isFinite(normalizedLeadHours) && normalizedLeadHours >= 0 ? normalizedLeadHours : 24;
@@ -46,6 +83,14 @@ const getEarliestBookableDateTime = (leadHours = 24) => {
     }
 
     return new Date(Date.now() + safeLeadHours * 60 * 60 * 1000);
+};
+
+const getHoursUntilAppointment = (appointment) => {
+    const date = normalizeDateValue(appointment.appointmentDate);
+    const time = String(appointment.appointmentTime || '').slice(0, 8);
+    const appointmentDateTime = buildAppointmentDateTime(date, time);
+    if (!appointmentDateTime) return 0;
+    return (appointmentDateTime.getTime() - Date.now()) / (60 * 60 * 1000);
 };
 
 const normalizeServiceIds = (serviceIds) => {
@@ -153,6 +198,32 @@ const normalizeDateValue = (value) => {
         return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
     }
     return String(value).slice(0, 10);
+};
+
+const buildAppointmentWarnings = (appointment) => {
+    const warnings = [];
+    const appointmentDate = normalizeDateValue(appointment.appointmentDate);
+    const appointmentTime = String(appointment.appointmentTime || '').slice(0, 8);
+    const appointmentDateTime = buildAppointmentDateTime(appointmentDate, appointmentTime);
+
+    if (!appointmentDateTime) return warnings;
+
+    const minutesUntil = Math.round((appointmentDateTime.getTime() - Date.now()) / (60 * 1000));
+    const minutesLate = Math.round((Date.now() - appointmentDateTime.getTime()) / (60 * 1000));
+
+    if (appointment.status === 'confirmed' && minutesUntil >= 0 && minutesUntil <= 60) {
+        warnings.push({ type: 'upcoming_checkin', label: 'Sắp đến giờ, chưa check-in', minutesUntil });
+    }
+
+    if (appointment.status === 'confirmed' && minutesLate > 0) {
+        warnings.push({ type: 'late_checkin', label: 'Quá giờ hẹn, chưa check-in', minutesLate });
+    }
+
+    if (appointment.status === 'pending' && minutesUntil >= 0 && minutesUntil <= 240) {
+        warnings.push({ type: 'pending_confirmation', label: 'Sắp đến giờ, chưa xác nhận', minutesUntil });
+    }
+
+    return warnings;
 };
 
 const recordAppointmentStatusHistory = async (connection, appointmentId, oldStatus, newStatus, userId, reason = null, note = null) => {
@@ -391,6 +462,17 @@ const appointmentController = {
 
             const { dentistId, appointmentDate, appointmentTime, notes, serviceIds } = req.body;
             const normalizedServiceIds = normalizeServiceIds(serviceIds);
+            const policySettings = await getAppointmentPolicySettings(connection);
+
+            if (req.user.role === 'patient') {
+                if (policySettings.maintenanceMode) {
+                    throw new Error('Hệ thống đang bảo trì, vui lòng liên hệ hotline để đặt lịch.');
+                }
+
+                if (!policySettings.allowOnlineBooking) {
+                    throw new Error('Phòng khám đang tạm ngưng đặt lịch online. Vui lòng liên hệ lễ tân.');
+                }
+            }
 
             let patientId = req.user.id;
             if (req.user.role === 'admin' || req.user.role === 'staff') {
@@ -404,12 +486,16 @@ const appointmentController = {
                 throw new Error('Vui lòng cung cấp ngày, giờ và ít nhất một dịch vụ.');
             }
 
+            if (normalizedServiceIds.length > policySettings.maxServicesPerAppointment) {
+                throw new Error(`Mỗi lịch hẹn chỉ được chọn tối đa ${policySettings.maxServicesPerAppointment} dịch vụ.`);
+            }
+
             const appointmentDateTime = buildAppointmentDateTime(appointmentDate, appointmentTime);
             if (!appointmentDateTime) {
                 throw new Error('Ngày hoặc giờ hẹn không hợp lệ.');
             }
 
-            const bookingLeadHours = await getBookingLeadHours(connection);
+            const bookingLeadHours = policySettings.bookingLeadHours;
             if (appointmentDateTime < getEarliestBookableDateTime(bookingLeadHours)) {
                 throw new Error(`Cần đặt lịch trước ít nhất ${bookingLeadHours} giờ.`);
             }
@@ -475,6 +561,16 @@ const appointmentController = {
                 );
             }
 
+            if (policySettings.notifyStaffOnNewAppointment) {
+                await createNotificationsForRoles(
+                    connection,
+                    ['admin', 'staff'],
+                    'Lịch hẹn mới',
+                    `Có lịch hẹn #${appointmentId} mới cần kiểm tra và xác nhận.`,
+                    'appointment'
+                );
+            }
+
             await connection.commit();
 
             res.status(201).json({
@@ -497,6 +593,13 @@ const appointmentController = {
         try {
             const role = req.user.role;
             const userId = req.user.id;
+            const {
+                date,
+                dateFrom,
+                dateTo,
+                dentistId,
+                status
+            } = req.query;
 
             let query = `
                 SELECT 
@@ -534,15 +637,78 @@ const appointmentController = {
             } else if (role === 'dentist') {
                 query += ' AND a.dentistId = ?';
                 queryParams.push(userId);
+            } else if (dentistId && dentistId !== 'all') {
+                const normalizedDentistId = Number(dentistId);
+                if (!Number.isInteger(normalizedDentistId) || normalizedDentistId <= 0) {
+                    return res.status(400).json({ success: false, message: 'ID bác sĩ không hợp lệ.' });
+                }
+                query += ' AND a.dentistId = ?';
+                queryParams.push(normalizedDentistId);
+            }
+
+            if (status && status !== 'all') {
+                if (!validAppointmentStatuses.includes(status)) {
+                    return res.status(400).json({ success: false, message: 'Trạng thái lịch hẹn không hợp lệ.' });
+                }
+                query += ' AND a.status = ?';
+                queryParams.push(status);
+            }
+
+            if (date) {
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+                    return res.status(400).json({ success: false, message: 'Ngày lọc không hợp lệ.' });
+                }
+                query += ' AND a.appointmentDate = ?';
+                queryParams.push(date);
+            } else {
+                if (dateFrom) {
+                    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateFrom)) {
+                        return res.status(400).json({ success: false, message: 'Ngày bắt đầu không hợp lệ.' });
+                    }
+                    query += ' AND a.appointmentDate >= ?';
+                    queryParams.push(dateFrom);
+                }
+
+                if (dateTo) {
+                    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateTo)) {
+                        return res.status(400).json({ success: false, message: 'Ngày kết thúc không hợp lệ.' });
+                    }
+                    query += ' AND a.appointmentDate <= ?';
+                    queryParams.push(dateTo);
+                }
             }
 
             query += ' ORDER BY a.appointmentDate DESC, a.appointmentTime DESC';
 
             const [appointments] = await pool.query(query, queryParams);
+            const appointmentIds = appointments.map((appointment) => appointment.id);
+            let historyByAppointment = new Map();
+
+            if (appointmentIds.length > 0) {
+                const [historyRows] = await pool.query(
+                    `SELECT h.id, h.appointmentId, h.oldStatus, h.newStatus, h.reason, h.note, h.createdAt,
+                            u.fullName as changedByName
+                     FROM AppointmentStatusHistory h
+                     LEFT JOIN Users u ON u.id = h.changedBy
+                     WHERE h.appointmentId IN (?)
+                     ORDER BY h.createdAt ASC, h.id ASC`,
+                    [appointmentIds]
+                );
+
+                historyByAppointment = historyRows.reduce((map, row) => {
+                    const current = map.get(row.appointmentId) || [];
+                    current.push(row);
+                    map.set(row.appointmentId, current);
+                    return map;
+                }, new Map());
+            }
+
             const normalizedAppointments = appointments.map((appointment) => ({
                 ...appointment,
                 serviceIds: appointment.serviceIds ? appointment.serviceIds.split(',').map((id) => Number(id)) : [],
-                serviceNames: appointment.serviceNames || ''
+                serviceNames: appointment.serviceNames || '',
+                statusHistory: historyByAppointment.get(appointment.id) || [],
+                warnings: buildAppointmentWarnings(appointment)
             }));
 
             res.json({
@@ -657,6 +823,24 @@ const appointmentController = {
                 return res.json({ success: true, message: 'Trạng thái lịch hẹn không thay đổi.' });
             }
 
+            const policySettings = await getAppointmentPolicySettings(connection);
+
+            if (req.user.role === 'patient' && status === 'cancelled') {
+                if (!policySettings.allowPatientCancellation) {
+                    await connection.rollback();
+                    return res.status(403).json({ success: false, message: 'Phòng khám đang tắt chức năng khách hàng tự hủy lịch.' });
+                }
+
+                const hoursUntilAppointment = getHoursUntilAppointment(appt);
+                if (hoursUntilAppointment < policySettings.cancellationLeadHours) {
+                    await connection.rollback();
+                    return res.status(400).json({
+                        success: false,
+                        message: `Chỉ có thể tự hủy lịch trước giờ hẹn ít nhất ${policySettings.cancellationLeadHours} giờ.`
+                    });
+                }
+            }
+
             if (status === 'confirmed' && !appt.dentistId) {
                 await connection.rollback();
                 return res.status(400).json({ success: false, message: 'Cần phân công bác sĩ trước khi xác nhận lịch hẹn.' });
@@ -674,7 +858,7 @@ const appointmentController = {
             await updateAppointmentStatusFields(connection, id, status, { reason, note });
             await recordAppointmentStatusHistory(connection, id, appt.status, status, req.user.id, reason, note);
 
-            if (status === 'confirmed') {
+            if (status === 'confirmed' && policySettings.notifyPatientOnStatusChange) {
                 await createNotification(
                     connection,
                     appt.patientId,
@@ -694,7 +878,7 @@ const appointmentController = {
                 );
             }
 
-            if (status === 'cancelled') {
+            if (status === 'cancelled' && policySettings.notifyPatientOnStatusChange) {
                 await createNotification(
                     connection,
                     appt.patientId,
@@ -853,17 +1037,33 @@ const appointmentController = {
                 return res.status(400).json({ success: false, message: 'Chỉ có thể dời lịch đang chờ xác nhận hoặc đã xác nhận.' });
             }
 
+            const policySettings = await getAppointmentPolicySettings(connection);
+
             if (req.user.role === 'patient') {
                 if (appt.patientId !== req.user.id) {
                     await connection.rollback();
                     return res.status(403).json({ success: false, message: 'Không thể dời lịch của người khác.' });
+                }
+
+                if (!policySettings.allowPatientReschedule) {
+                    await connection.rollback();
+                    return res.status(403).json({ success: false, message: 'Phòng khám đang tắt chức năng khách hàng tự đổi lịch.' });
+                }
+
+                const hoursUntilAppointment = getHoursUntilAppointment(appt);
+                if (hoursUntilAppointment < policySettings.rescheduleLeadHours) {
+                    await connection.rollback();
+                    return res.status(400).json({
+                        success: false,
+                        message: `Chỉ có thể tự đổi lịch trước giờ hẹn ít nhất ${policySettings.rescheduleLeadHours} giờ.`
+                    });
                 }
             } else if (!['admin', 'staff'].includes(req.user.role)) {
                 await connection.rollback();
                 return res.status(403).json({ success: false, message: 'Bạn không có quyền dời lịch hẹn.' });
             }
 
-            const bookingLeadHours = await getBookingLeadHours(connection);
+            const bookingLeadHours = policySettings.bookingLeadHours;
             if (appointmentDateTime < getEarliestBookableDateTime(bookingLeadHours)) {
                 await connection.rollback();
                 return res.status(400).json({ success: false, message: `Cần đặt lịch trước ít nhất ${bookingLeadHours} giờ.` });
@@ -915,13 +1115,15 @@ const appointmentController = {
                 `Dời từ ${normalizeDateValue(appt.appointmentDate)} ${String(appt.appointmentTime).slice(0, 5)} sang ${appointmentDate} ${String(appointmentTime).slice(0, 5)}${note ? `. ${note}` : ''}`
             );
 
-            await createNotification(
-                connection,
-                appt.patientId,
-                'Lịch hẹn đã được dời',
-                `Lịch hẹn #${appointmentId} đã được dời sang ${appointmentDate} ${String(appointmentTime).slice(0, 5)}.`,
-                'appointment'
-            );
+            if (policySettings.notifyPatientOnStatusChange) {
+                await createNotification(
+                    connection,
+                    appt.patientId,
+                    'Lịch hẹn đã được dời',
+                    `Lịch hẹn #${appointmentId} đã được dời sang ${appointmentDate} ${String(appointmentTime).slice(0, 5)}.`,
+                    'appointment'
+                );
+            }
 
             if (appt.dentistId) {
                 await createNotification(

@@ -1,5 +1,6 @@
 const pool = require('../config/database');
 
+const notificationTypes = ['appointment', 'payment', 'chat', 'system', 'leave'];
 const preferenceKeys = ['appointment', 'payment', 'chat', 'system'];
 const preferenceColumnByKey = {
     appointment: 'appointment',
@@ -31,6 +32,7 @@ const notificationController = {
         try {
             const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
             const unreadOnly = toBool(req.query.unreadOnly);
+            const type = req.query.type;
 
             let query = `
                 SELECT id, title, message, type, isRead, createdAt
@@ -43,12 +45,53 @@ const notificationController = {
                 query += ' AND isRead = 0';
             }
 
+            if (type && type !== 'all') {
+                if (!notificationTypes.includes(type)) {
+                    return res.status(400).json({ success: false, message: 'Loại thông báo không hợp lệ.' });
+                }
+
+                query += ' AND type = ?';
+                params.push(type);
+            }
+
             query += ' ORDER BY createdAt DESC LIMIT ?';
             params.push(limit);
 
-            const [rows] = await pool.query(query, params);
+            const [[summaryRow], [typeRows], [rows]] = await Promise.all([
+                pool.query(
+                    `SELECT COUNT(*) as total, SUM(CASE WHEN isRead = 0 THEN 1 ELSE 0 END) as unread
+                     FROM Notifications
+                     WHERE userId = ?`,
+                    [req.user.id]
+                ).then(([result]) => [result[0]]),
+                pool.query(
+                    `SELECT type, COUNT(*) as total, SUM(CASE WHEN isRead = 0 THEN 1 ELSE 0 END) as unread
+                     FROM Notifications
+                     WHERE userId = ?
+                     GROUP BY type`,
+                    [req.user.id]
+                ).then(([result]) => [result]),
+                pool.query(query, params)
+            ]);
 
-            res.json({ success: true, message: 'Lấy thông báo thành công.', data: rows });
+            const byType = Object.fromEntries(notificationTypes.map((item) => [item, { total: 0, unread: 0 }]));
+            typeRows.forEach((row) => {
+                byType[row.type || 'system'] = {
+                    total: Number(row.total || 0),
+                    unread: Number(row.unread || 0)
+                };
+            });
+
+            res.json({
+                success: true,
+                message: 'Lấy thông báo thành công.',
+                data: rows,
+                summary: {
+                    total: Number(summaryRow?.total || 0),
+                    unread: Number(summaryRow?.unread || 0),
+                    byType
+                }
+            });
         } catch (error) {
             next(error);
         }

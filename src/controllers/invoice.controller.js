@@ -40,6 +40,47 @@ const getInvoiceItems = async (connectionOrPool, invoiceIds) => {
     }, new Map());
 };
 
+const getInvoicePayments = async (connectionOrPool, invoiceIds) => {
+    const ids = [...new Set((Array.isArray(invoiceIds) ? invoiceIds : [invoiceIds]).map(Number).filter(Boolean))];
+    if (ids.length === 0) return new Map();
+
+    const [payments] = await connectionOrPool.query(
+        `SELECT id, invoiceId, amount, paymentMethod, transactionId, status, createdAt
+         FROM Payments
+         WHERE invoiceId IN (?)
+         ORDER BY createdAt DESC, id DESC`,
+        [ids]
+    );
+
+    return payments.reduce((map, payment) => {
+        const current = map.get(payment.invoiceId) || [];
+        current.push({
+            ...payment,
+            amount: Number(payment.amount || 0)
+        });
+        map.set(payment.invoiceId, current);
+        return map;
+    }, new Map());
+};
+
+const mapInvoice = (invoice, itemsByInvoice, paymentsByInvoice) => {
+    const subtotalAmount = money(invoice.subtotalAmount || invoice.totalAmount);
+    const discountAmount = money(invoice.discountAmount);
+    const paidAmount = money(invoice.paidAmount);
+    const totalAmount = money(invoice.totalAmount);
+
+    return {
+        ...invoice,
+        subtotalAmount,
+        discountAmount,
+        paidAmount,
+        totalAmount,
+        outstandingAmount: Math.max(totalAmount - paidAmount, 0),
+        items: itemsByInvoice.get(invoice.id) || [],
+        payments: paymentsByInvoice.get(invoice.id) || []
+    };
+};
+
 const invoiceController = {
     createInvoice: async (req, res, next) => {
         const connection = await pool.getConnection();
@@ -207,28 +248,68 @@ const invoiceController = {
 
             const [invoices] = await pool.query(query, queryParams);
             const itemsByInvoice = await getInvoiceItems(pool, invoices.map((invoice) => invoice.id));
-
-            const data = invoices.map((invoice) => {
-                const subtotalAmount = money(invoice.subtotalAmount || invoice.totalAmount);
-                const discountAmount = money(invoice.discountAmount);
-                const paidAmount = money(invoice.paidAmount);
-                const totalAmount = money(invoice.totalAmount);
-
-                return {
-                    ...invoice,
-                    subtotalAmount,
-                    discountAmount,
-                    paidAmount,
-                    totalAmount,
-                    outstandingAmount: Math.max(totalAmount - paidAmount, 0),
-                    items: itemsByInvoice.get(invoice.id) || []
-                };
-            });
+            const paymentsByInvoice = await getInvoicePayments(pool, invoices.map((invoice) => invoice.id));
+            const data = invoices.map((invoice) => mapInvoice(invoice, itemsByInvoice, paymentsByInvoice));
 
             res.json({
                 success: true,
                 message: 'Lấy danh sách hóa đơn thành công.',
                 data
+            });
+        } catch (error) {
+            next(error);
+        }
+    },
+
+    getInvoiceById: async (req, res, next) => {
+        try {
+            const invoiceId = Number(req.params.id);
+            if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+                return res.status(400).json({ success: false, message: 'ID hóa đơn không hợp lệ.' });
+            }
+
+            let query = `
+                SELECT i.*, p.fullName as patientName, p.phone as patientPhone, p.email as patientEmail,
+                       a.appointmentDate, a.appointmentTime,
+                       d.fullName as dentistName,
+                       pay.paymentMethod as lastPaymentMethod,
+                       pay.transactionId as lastTransactionId,
+                       pay.createdAt as paidAt
+                FROM Invoices i
+                JOIN Users p ON i.patientId = p.id
+                JOIN Appointments a ON i.appointmentId = a.id
+                LEFT JOIN Users d ON a.dentistId = d.id
+                LEFT JOIN (
+                    SELECT p1.*
+                    FROM Payments p1
+                    INNER JOIN (
+                        SELECT invoiceId, MAX(id) as latestPaymentId
+                        FROM Payments
+                        WHERE status = "success"
+                        GROUP BY invoiceId
+                    ) latest ON p1.id = latest.latestPaymentId
+                ) pay ON pay.invoiceId = i.id
+                WHERE i.id = ?
+            `;
+            const params = [invoiceId];
+
+            if (req.user.role === 'patient') {
+                query += ' AND i.patientId = ?';
+                params.push(req.user.id);
+            }
+
+            const [invoices] = await pool.query(query, params);
+            if (invoices.length === 0) {
+                return res.status(404).json({ success: false, message: 'Không tìm thấy hóa đơn.' });
+            }
+
+            const itemsByInvoice = await getInvoiceItems(pool, invoiceId);
+            const paymentsByInvoice = await getInvoicePayments(pool, invoiceId);
+
+            res.json({
+                success: true,
+                message: 'Lấy chi tiết hóa đơn thành công.',
+                data: mapInvoice(invoices[0], itemsByInvoice, paymentsByInvoice)
             });
         } catch (error) {
             next(error);

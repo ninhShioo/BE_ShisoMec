@@ -16,6 +16,17 @@ const parseAttachments = (attachments) => {
     }
 };
 
+const parseJsonArray = (value) => {
+    if (!value) return JSON.stringify([]);
+
+    try {
+        const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+        return JSON.stringify(Array.isArray(parsed) ? parsed : []);
+    } catch {
+        return JSON.stringify([]);
+    }
+};
+
 const cleanText = (value) => {
     if (value === undefined || value === null) return null;
     const text = String(value).trim();
@@ -43,6 +54,22 @@ const recordAppointmentStatusHistory = async (connection, appointmentId, oldStat
 
 const mapRecord = (record) => ({
     ...record,
+    toothPositions: (() => {
+        try {
+            const parsed = JSON.parse(record.toothPositions || '[]');
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    })(),
+    treatmentSessions: (() => {
+        try {
+            const parsed = JSON.parse(record.treatmentSessions || '[]');
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    })(),
     attachments: (() => {
         try {
             const parsed = JSON.parse(record.attachments || '[]');
@@ -63,7 +90,9 @@ const medicalRecordController = {
                 chiefComplaint,
                 diagnosis,
                 treatmentPlan,
+                treatmentSessions,
                 procedures,
+                toothPositions,
                 prescription,
                 notes,
                 nextAppointmentDate,
@@ -129,8 +158,8 @@ const medicalRecordController = {
             await connection.query(
                 `INSERT INTO MedicalRecords
                  (appointmentId, patientId, dentistId, diagnosis, chiefComplaint, treatmentPlan, procedures,
-                  prescription, notes, nextAppointmentDate, nextAppointmentNote, attachments)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  treatmentSessions, toothPositions, prescription, notes, nextAppointmentDate, nextAppointmentNote, attachments)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
                     appointmentId,
                     appointment.patientId,
@@ -139,6 +168,8 @@ const medicalRecordController = {
                     cleanText(chiefComplaint),
                     cleanText(treatmentPlan),
                     cleanText(procedures),
+                    parseJsonArray(treatmentSessions),
+                    parseJsonArray(toothPositions),
                     cleanText(prescription),
                     cleanText(notes),
                     normalizedNextDate,
@@ -200,7 +231,8 @@ const medicalRecordController = {
 
             let query = `
                 SELECT
-                    m.id, m.appointmentId, m.diagnosis, m.chiefComplaint, m.treatmentPlan, m.procedures,
+                    m.id, m.appointmentId, m.diagnosis, m.chiefComplaint, m.treatmentPlan, m.treatmentSessions,
+                    m.toothPositions, m.procedures,
                     m.prescription, m.notes, m.nextAppointmentDate, m.nextAppointmentNote, m.attachments,
                     m.createdAt, m.updatedAt,
                     a.appointmentDate, a.appointmentTime,
@@ -222,7 +254,12 @@ const medicalRecordController = {
             const queryParams = [targetPatientId];
 
             if (req.user.role === 'dentist') {
-                query += ' AND m.dentistId = ?';
+                query += ` AND EXISTS (
+                    SELECT 1
+                    FROM Appointments own
+                    WHERE own.patientId = m.patientId
+                    AND own.dentistId = ?
+                )`;
                 queryParams.push(req.user.id);
             }
 

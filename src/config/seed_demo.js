@@ -88,7 +88,23 @@ const demoSettings = {
     phone: '0869 800 318',
     email: 'contact@phenikaadental.vn',
     address: 'Tòa nhà Phenikaa Tower, Hà Đông, Hà Nội',
+    openingHours: '08:00 - 20:00',
+    mapUrl: '',
+    facebookUrl: '',
+    zaloPhone: '0869 800 318',
+    bookingLeadHours: '24',
+    appointmentReminderHours: '4',
+    cancellationLeadHours: '6',
+    rescheduleLeadHours: '12',
+    autoNoShowMinutes: '30',
+    maxServicesPerAppointment: '4',
+    slotIntervalMinutes: '30',
     maintenanceMode: 'false',
+    allowOnlineBooking: 'true',
+    allowPatientCancellation: 'true',
+    allowPatientReschedule: 'true',
+    notifyStaffOnNewAppointment: 'true',
+    notifyPatientOnStatusChange: 'true',
     theme: 'light'
 };
 

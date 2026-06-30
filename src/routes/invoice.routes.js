@@ -8,6 +8,7 @@ router.use(verifyToken);
 
 router.post('/', checkRole(['admin', 'staff']), logActivity('CREATE_INVOICE', 'Invoices'), invoiceController.createInvoice);
 router.get('/', checkRole(['patient', 'admin', 'staff']), invoiceController.getAllInvoices);
+router.get('/:id', checkRole(['patient', 'admin', 'staff']), invoiceController.getInvoiceById);
 router.put('/:id/pay', checkRole(['admin', 'staff']), logActivity('PAY_INVOICE', 'Invoices'), invoiceController.payInvoice);
 
 module.exports = router;

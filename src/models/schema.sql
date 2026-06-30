@@ -45,6 +45,22 @@ CREATE TABLE IF NOT EXISTS DoctorDaysOff (
     FOREIGN KEY (dentistId) REFERENCES Users(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS DoctorDayOffRequests (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    dentistId INT NOT NULL,
+    offDate DATE NOT NULL,
+    reason VARCHAR(255),
+    status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
+    reviewedBy INT,
+    reviewNote TEXT,
+    createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    reviewedAt TIMESTAMP NULL,
+    FOREIGN KEY (dentistId) REFERENCES Users(id) ON DELETE CASCADE,
+    FOREIGN KEY (reviewedBy) REFERENCES Users(id) ON DELETE SET NULL,
+    UNIQUE KEY uq_day_off_request_pending (dentistId, offDate, status),
+    INDEX idx_day_off_request_status (status, offDate)
+);
+
 CREATE TABLE IF NOT EXISTS Services (
     id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(150) NOT NULL,
@@ -136,7 +152,9 @@ CREATE TABLE IF NOT EXISTS MedicalRecords (
     diagnosis TEXT NOT NULL,
     chiefComplaint TEXT,
     treatmentPlan TEXT,
+    treatmentSessions TEXT,
     procedures TEXT,
+    toothPositions TEXT,
     prescription TEXT,
     notes TEXT,
     nextAppointmentDate DATE,
@@ -251,7 +269,7 @@ CREATE TABLE IF NOT EXISTS Notifications (
     title VARCHAR(255) NOT NULL,
     message TEXT NOT NULL,
     isRead BOOLEAN DEFAULT FALSE,
-    type ENUM('system', 'appointment', 'payment', 'chat') DEFAULT 'system',
+    type ENUM('system', 'appointment', 'payment', 'chat', 'leave') DEFAULT 'system',
     createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (userId) REFERENCES Users(id) ON DELETE CASCADE
 );

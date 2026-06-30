@@ -55,8 +55,8 @@ const step = async (name, fn) => {
     console.log('OK');
 };
 
-const findAvailableSlot = async () => {
-    for (let offset = 7; offset <= 60; offset += 1) {
+const findAvailableSlot = async (startOffset = 7) => {
+    for (let offset = startOffset; offset <= 60; offset += 1) {
         const appointmentDate = buildFutureDate(offset);
         const payload = await request(
             'GET',
@@ -153,6 +153,50 @@ const main = async () => {
         state.appointmentId = payload.data.appointmentId;
     });
 
+    await step('Staff can filter and reschedule appointment', async () => {
+        const nextSlot = await findAvailableSlot(10);
+        await request('PUT', `/appointments/${state.appointmentId}/reschedule`, {
+            token: state.tokens.staff,
+            expectedStatus: 200,
+            body: {
+                ...nextSlot,
+                reason: 'Smoke test reschedule',
+                note: 'Test quick reschedule flow'
+            }
+        });
+
+        const payload = await request('GET', `/appointments?date=${nextSlot.appointmentDate}&dentistId=${state.dentistId}&status=pending`, {
+            token: state.tokens.staff,
+            expectedStatus: 200
+        });
+
+        const found = payload.data.find((appointment) => appointment.id === state.appointmentId);
+        if (!found || !Array.isArray(found.statusHistory)) {
+            throw new Error('Filtered appointment list did not include status history.');
+        }
+    });
+
+    await step('Dentist requests day off and admin approves it', async () => {
+        const offDate = buildFutureDate(75 + (Date.now() % 20));
+        const payload = await request('POST', '/schedules/day-off-requests', {
+            token: state.tokens.dentist,
+            expectedStatus: 201,
+            body: {
+                offDate,
+                reason: 'Smoke test leave request'
+            }
+        });
+
+        await request('PUT', `/schedules/day-off-requests/${payload.data.id}`, {
+            token: state.tokens.admin,
+            expectedStatus: 200,
+            body: {
+                status: 'approved',
+                reviewNote: 'Smoke test approved'
+            }
+        });
+    });
+
     await step('Staff assigns dentist', async () => {
         await request('PUT', `/appointments/${state.appointmentId}/assign`, {
             token: state.tokens.staff,
@@ -192,11 +236,25 @@ const main = async () => {
             body: {
                 appointmentId: state.appointmentId,
                 diagnosis: 'Kiểm tra smoke test',
+                toothPositions: JSON.stringify([11, 21]),
+                treatmentSessions: JSON.stringify([{ title: 'Tái khám', plannedDate: buildFutureDate(30), status: 'planned', note: 'Theo dõi sau điều trị' }]),
                 prescription: 'Theo dõi và tái khám khi cần',
                 notes: 'Created by smoke_api.js',
                 attachments: []
             }
         });
+    });
+
+    await step('Patient can read medical record history', async () => {
+        const payload = await request('GET', `/records/patient/${state.users.patient.id}`, {
+            token: state.tokens.patient,
+            expectedStatus: 200
+        });
+
+        const record = payload.data.find((item) => item.appointmentId === state.appointmentId);
+        if (!record || !Array.isArray(record.toothPositions) || !Array.isArray(record.treatmentSessions)) {
+            throw new Error('Medical record history did not include dental treatment details.');
+        }
     });
 
     await step('Admin creates invoice', async () => {
@@ -232,6 +290,28 @@ const main = async () => {
         const hasCreatedInvoice = payload.data.some((invoice) => invoice.id === state.invoiceId);
         if (!hasCreatedInvoice) {
             throw new Error(`Patient invoice list does not include invoice ${state.invoiceId}`);
+        }
+    });
+
+    await step('Staff can read invoice detail with payment history', async () => {
+        const payload = await request('GET', `/invoices/${state.invoiceId}`, {
+            token: state.tokens.staff,
+            expectedStatus: 200
+        });
+
+        if (!Array.isArray(payload.data.items) || payload.data.items.length === 0 || !Array.isArray(payload.data.payments) || payload.data.payments.length === 0) {
+            throw new Error('Invoice detail did not include items and payment history.');
+        }
+    });
+
+    await step('Notification history supports grouped filters', async () => {
+        const payload = await request('GET', '/notifications?type=payment&limit=20', {
+            token: state.tokens.staff,
+            expectedStatus: 200
+        });
+
+        if (!payload.summary || !payload.summary.byType) {
+            throw new Error('Notification history did not return grouped summary.');
         }
     });
 
