@@ -1,86 +1,85 @@
-# Phenikaa Dental - DOAN1
+# Phenikaa Dental Backend
 
-Ứng dụng quản lý và đặt lịch nha khoa gồm backend Express/MySQL và frontend React/Vite.
+Backend của đồ án DOAN1, nằm độc lập trong thư mục `backend/`.
 
-## Yêu cầu
+## Công nghệ
 
-- Node.js 18+
-- MySQL 8+ hoặc MariaDB tương thích
-- Tài khoản Cloudinary nếu dùng upload ảnh/tài liệu
+- Express 5
+- MySQL/MariaDB qua `mysql2`
+- Socket.IO realtime
+- JWT authentication
+- Cloudinary upload ảnh/tài liệu
+- Migration/seed nhẹ qua `src/config/init_db.js`
 
 ## Cài đặt
 
 ```bash
+cd backend
 npm install
-cd frontend
-npm install
-cd ..
 ```
 
-Tạo file `.env` từ `.env.example` và điền cấu hình thật:
+Tạo file `.env` từ `.env.example`:
 
 ```bash
 copy .env.example .env
 ```
 
-Nếu cần cấu hình frontend riêng, tạo `frontend/.env` từ `frontend/.env.example`.
+Các biến quan trọng:
 
-## Khởi tạo dữ liệu
+- `PORT`: cổng backend, mặc định `8080`.
+- `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_PORT`: cấu hình MySQL.
+- `JWT_SECRET`: khóa ký JWT, nên dài và riêng cho môi trường thật.
+- `CORS_ORIGIN`: domain frontend được phép gọi API, ví dụ `http://localhost:5173`.
+- `GOOGLE_CLIENT_ID`: OAuth Client ID cho đăng nhập Google.
+- `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`: dùng upload.
+- `BACKEND_URL`, `FRONTEND_URL`: domain public dùng cho redirect/callback.
+- `VNPAY_TMN_CODE`, `VNPAY_HASH_SECRET`: thông tin merchant VNPay sandbox/production.
+- `VNPAY_PAYMENT_URL`, `VNPAY_RETURN_URL`, `VNPAY_IPN_URL`: URL thanh toán và callback VNPay.
+
+## Khởi tạo database
 
 ```bash
 npm run db:setup
 ```
 
-Lệnh này tạo bảng, bổ sung migration nhẹ và seed dữ liệu demo. Có thể chạy lại nhiều lần, không reset dữ liệu.
+Lệnh này:
 
-## Chạy dự án
+- Tạo database nếu chưa có.
+- Tạo bảng từ `src/models/schema.sql`.
+- Bổ sung các cột/index tương thích cho DB cũ.
+- Seed dữ liệu demo.
 
-Backend:
+## Chạy backend
 
 ```bash
 npm run dev
 ```
 
-Frontend:
+Hoặc chạy production local:
 
 ```bash
-cd frontend
-npm run dev
+npm start
 ```
 
 Mặc định:
 
-- Backend: `http://localhost:8080`
+- Server: `http://localhost:8080`
 - API: `http://localhost:8080/api`
-- Frontend: `http://localhost:5173`
-- Health check: `http://localhost:8080/health`
+- Health: `http://localhost:8080/health`
 
-## Kiểm tra nhanh
-
-Kiểm tra môi trường:
+## Script hữu ích
 
 ```bash
 npm run doctor
-```
-
-Kiểm tra luồng API chính:
-
-```bash
 npm run smoke:api
+npm run smoke:clean
+npm run db:backup
 ```
 
-Kiểm tra health endpoint:
-
-```bash
-curl http://localhost:8080/health
-```
-
-Build frontend:
-
-```bash
-cd frontend
-npm run build
-```
+- `doctor`: kiểm tra cấu hình/môi trường cơ bản.
+- `smoke:api`: kiểm tra luồng API chính.
+- `smoke:clean`: dọn dữ liệu smoke test.
+- `db:backup`: backup MySQL vào `backend/backups/`.
 
 ## Tài khoản demo
 
@@ -91,32 +90,20 @@ npm run build
 | Dentist | `dentist@doan1.local` | `Dentist@123` |
 | Patient | `patient@doan1.local` | `Patient@123` |
 
-## Cấu hình deploy
+## Module chính
 
-- `PORT`: cổng backend.
-- `JWT_SECRET`: khóa ký JWT, nên dài ít nhất 32 ký tự.
-- `CORS_ORIGIN`: domain frontend được phép gọi API, có thể nhập nhiều domain bằng dấu phẩy.
-- `BODY_LIMIT`: giới hạn JSON/form body, mặc định `1mb`.
-- `RATE_LIMIT_WINDOW_MS`: khung thời gian rate limit.
-- `RATE_LIMIT_MAX`: số request tối đa trong khung thời gian.
-- `GOOGLE_CLIENT_ID`: OAuth Client ID dùng xác thực đăng nhập Google.
-- `VITE_API_URL`: URL API cho frontend.
-- `VITE_SOCKET_URL`: URL socket cho frontend.
-- `VITE_GOOGLE_CLIENT_ID`: OAuth Client ID dùng hiển thị nút Google ở frontend.
+- Auth: đăng nhập thường, Google login/register, đổi mật khẩu.
+- Appointment: đặt lịch, slot bác sĩ, lọc lịch, dời lịch, timeline trạng thái.
+- Schedule: lịch làm việc tuần, ngày nghỉ, yêu cầu nghỉ phép.
+- Medical record: hồ sơ khám, vị trí răng, kế hoạch điều trị nhiều buổi.
+- Invoice/payment: hóa đơn, chi tiết hóa đơn, lịch sử thanh toán.
+- VNPay: tạo link thanh toán, nhận return/IPN, tự ghi nhận payment.
+- Notification: realtime Socket.IO, lịch sử thông báo theo loại.
+- Chat: hộp chat khách hàng/nhân viên.
 
-## Luồng nghiệp vụ chính
+## Tài liệu
 
-1. Patient đặt lịch với dịch vụ.
-2. Staff/Admin phân công bác sĩ.
-3. Staff/Admin xác nhận lịch.
-4. Dentist tạo hồ sơ khám, hệ thống chuyển lịch sang hoàn thành.
-5. Staff/Admin xuất hóa đơn.
-6. Staff/Admin thanh toán hóa đơn.
-7. Patient xem hóa đơn và hồ sơ của mình.
-
-## Tài liệu liên quan
-
-- [Backend smoke test](docs/backend-smoke-test.md)
-- [Demo checklist](docs/demo-checklist.md)
-- [API reference](docs/api-reference.md)
-- [Deployment notes](docs/deployment-notes.md)
+- `docs/api-reference.md`
+- `docs/demo-checklist.md`
+- `docs/deployment-notes.md`
+- `docs/backend-smoke-test.md`

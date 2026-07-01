@@ -35,8 +35,24 @@ const cleanText = (value) => {
 
 const normalizeDate = (value) => {
     if (!value) return null;
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        return [
+            value.getFullYear(),
+            String(value.getMonth() + 1).padStart(2, '0'),
+            String(value.getDate()).padStart(2, '0')
+        ].join('-');
+    }
     const text = String(value).slice(0, 10);
     return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
+};
+
+const todayValue = () => {
+    const now = new Date();
+    return [
+        now.getFullYear(),
+        String(now.getMonth() + 1).padStart(2, '0'),
+        String(now.getDate()).padStart(2, '0')
+    ].join('-');
 };
 
 const recordAppointmentStatusHistory = async (connection, appointmentId, oldStatus, newStatus, userId, reason = null, note = null) => {
@@ -111,7 +127,7 @@ const medicalRecordController = {
             await connection.beginTransaction();
 
             const [appointments] = await connection.query(
-                'SELECT patientId, dentistId, status FROM Appointments WHERE id = ? FOR UPDATE',
+                'SELECT patientId, dentistId, status, appointmentDate FROM Appointments WHERE id = ? FOR UPDATE',
                 [appointmentId]
             );
             if (appointments.length === 0) {
@@ -154,6 +170,15 @@ const medicalRecordController = {
             }
 
             const normalizedNextDate = normalizeDate(nextAppointmentDate);
+            const appointmentDate = normalizeDate(appointment.appointmentDate);
+            const minNextDate = [todayValue(), appointmentDate].filter(Boolean).sort().pop();
+            if (normalizedNextDate && normalizedNextDate <= minNextDate) {
+                await connection.rollback();
+                return res.status(400).json({
+                    success: false,
+                    message: 'Ngày tái khám phải là ngày tiếp theo, không được là hôm nay hoặc trong quá khứ.'
+                });
+            }
 
             await connection.query(
                 `INSERT INTO MedicalRecords

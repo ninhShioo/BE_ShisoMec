@@ -598,7 +598,8 @@ const appointmentController = {
                 dateFrom,
                 dateTo,
                 dentistId,
-                status
+                status,
+                sort = 'date_desc'
             } = req.query;
 
             let query = `
@@ -678,7 +679,17 @@ const appointmentController = {
                 }
             }
 
-            query += ' ORDER BY a.appointmentDate DESC, a.appointmentTime DESC';
+            const sortOptions = {
+                date_asc: 'a.appointmentDate ASC, a.appointmentTime ASC, a.id ASC',
+                date_desc: 'a.appointmentDate DESC, a.appointmentTime DESC, a.id DESC',
+                created_asc: 'a.createdAt ASC, a.id ASC',
+                created_desc: 'a.createdAt DESC, a.id DESC'
+            };
+            if (!sortOptions[sort]) {
+                return res.status(400).json({ success: false, message: 'Thứ tự sắp xếp lịch hẹn không hợp lệ.' });
+            }
+
+            query += ` ORDER BY ${sortOptions[sort]}`;
 
             const [appointments] = await pool.query(query, queryParams);
             const appointmentIds = appointments.map((appointment) => appointment.id);

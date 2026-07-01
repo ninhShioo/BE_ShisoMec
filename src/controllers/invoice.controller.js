@@ -1,9 +1,11 @@
 const pool = require('../config/database');
+const crypto = require('crypto');
 const { createNotification, createNotificationsForRoles } = require('../services/notification.service');
 
-const validPaymentMethods = ['cash', 'card', 'transfer', 'vnpay', 'momo'];
+const validPaymentMethods = ['cash', 'card', 'transfer'];
 const validInvoicePaymentMethods = ['cash', 'card', 'transfer'];
 const invoiceReadableRoles = ['admin', 'staff', 'patient'];
+const vnpayDefaultPaymentUrl = 'https://sandbox.vnpayment.vn/paymentv2/vpcpay.html';
 
 const toInvoicePaymentMethod = (paymentMethod) => {
     if (paymentMethod === 'vnpay' || paymentMethod === 'momo') return 'transfer';
@@ -13,6 +15,247 @@ const toInvoicePaymentMethod = (paymentMethod) => {
 const money = (value) => {
     const amount = Number(value || 0);
     return Number.isFinite(amount) ? Math.max(amount, 0) : 0;
+};
+
+const normalizePublicUrl = (value, fallback) => {
+    const candidates = String(value || '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+    const url = candidates.find((item) => /^https?:\/\//i.test(item));
+    return (url || fallback).replace(/\/$/, '');
+};
+
+const getFrontendUrl = () => normalizePublicUrl(
+    process.env.FRONTEND_URL || process.env.CORS_ORIGIN,
+    'http://localhost:5173'
+);
+
+const getBackendUrl = () => normalizePublicUrl(
+    process.env.BACKEND_URL,
+    `http://localhost:${process.env.PORT || 8080}`
+);
+
+const isVnpayConfigured = () => Boolean(process.env.VNPAY_TMN_CODE && process.env.VNPAY_HASH_SECRET);
+
+const getClientIp = (req) => {
+    const forwardedFor = req.headers['x-forwarded-for'];
+    if (forwardedFor) return String(forwardedFor).split(',')[0].trim();
+    return req.socket?.remoteAddress || req.ip || '127.0.0.1';
+};
+
+const formatVnpayDate = (date = new Date()) => {
+    const pad = (value) => String(value).padStart(2, '0');
+    return [
+        date.getFullYear(),
+        pad(date.getMonth() + 1),
+        pad(date.getDate()),
+        pad(date.getHours()),
+        pad(date.getMinutes()),
+        pad(date.getSeconds())
+    ].join('');
+};
+
+const getVnpayExpireDate = (minutes = 15) => {
+    const expireDate = new Date(Date.now() + minutes * 60 * 1000);
+    return formatVnpayDate(expireDate);
+};
+
+const sortVnpayParams = (params) => Object.keys(params)
+    .filter((key) => params[key] !== undefined && params[key] !== null && params[key] !== '')
+    .sort()
+    .reduce((sorted, key) => {
+        sorted[key] = String(params[key]);
+        return sorted;
+    }, {});
+
+const encodeVnpayValue = (value) => encodeURIComponent(String(value)).replace(/%20/g, '+');
+
+const buildVnpayQuery = (params) => Object.keys(params)
+    .map((key) => `${encodeURIComponent(key)}=${encodeVnpayValue(params[key])}`)
+    .join('&');
+
+const signVnpayParams = (params) => {
+    const sortedParams = Object.keys(sortVnpayParams(params)).reduce((encoded, key) => {
+        encoded[encodeURIComponent(key)] = encodeVnpayValue(params[key]);
+        return encoded;
+    }, {});
+    const signData = Object.keys(sortedParams)
+        .map((key) => `${key}=${sortedParams[key]}`)
+        .join('&');
+    return crypto
+        .createHmac('sha512', process.env.VNPAY_HASH_SECRET)
+        .update(Buffer.from(signData, 'utf-8'))
+        .digest('hex');
+};
+
+const verifyVnpaySignature = (query) => {
+    if (!isVnpayConfigured()) return false;
+    const params = { ...query };
+    const secureHash = String(params.vnp_SecureHash || '').toLowerCase();
+    delete params.vnp_SecureHash;
+    delete params.vnp_SecureHashType;
+
+    return secureHash === signVnpayParams(params);
+};
+
+const parseInvoiceIdFromTxnRef = (txnRef) => {
+    const [invoiceId] = String(txnRef || '').split('-');
+    const normalizedInvoiceId = Number(invoiceId);
+    return Number.isInteger(normalizedInvoiceId) && normalizedInvoiceId > 0 ? normalizedInvoiceId : null;
+};
+
+const recordInvoicePayment = async (connection, invoiceId, paymentAmount, paymentMethod, transactionId) => {
+    const [invoices] = await connection.query(
+        'SELECT id, patientId, status, totalAmount, paidAmount FROM Invoices WHERE id = ? FOR UPDATE',
+        [invoiceId]
+    );
+
+    if (invoices.length === 0) {
+        return { ok: false, code: 'not_found', message: 'Không tìm thấy hóa đơn.' };
+    }
+
+    const invoice = invoices[0];
+    if (invoice.status === 'paid') {
+        return { ok: false, code: 'already_paid', message: 'Hóa đơn đã được thanh toán đủ.', invoice };
+    }
+
+    if (invoice.status === 'cancelled') {
+        return { ok: false, code: 'cancelled', message: 'Hóa đơn đã bị hủy.', invoice };
+    }
+
+    const totalAmount = money(invoice.totalAmount);
+    const paidAmount = money(invoice.paidAmount);
+    const outstandingAmount = Math.max(totalAmount - paidAmount, 0);
+    const safePaymentAmount = money(paymentAmount);
+
+    if (safePaymentAmount <= 0 || safePaymentAmount > outstandingAmount) {
+        return { ok: false, code: 'invalid_amount', message: 'Số tiền thanh toán không hợp lệ.', invoice };
+    }
+
+    const [existingPayments] = await connection.query(
+        'SELECT id FROM Payments WHERE transactionId = ? AND status = "success" LIMIT 1',
+        [transactionId]
+    );
+    if (transactionId && existingPayments.length > 0) {
+        return { ok: false, code: 'already_confirmed', message: 'Giao dịch đã được ghi nhận.', invoice };
+    }
+
+    const nextPaidAmount = paidAmount + safePaymentAmount;
+    const nextStatus = nextPaidAmount >= totalAmount ? 'paid' : 'partial';
+
+    await connection.query(
+        'UPDATE Invoices SET status = ?, paidAmount = ?, paymentMethod = ? WHERE id = ?',
+        [nextStatus, nextPaidAmount, toInvoicePaymentMethod(paymentMethod), invoiceId]
+    );
+
+    const [paymentResult] = await connection.query(
+        'INSERT INTO Payments (invoiceId, amount, paymentMethod, transactionId, status) VALUES (?, ?, ?, ?, "success")',
+        [invoiceId, safePaymentAmount, paymentMethod, transactionId || null]
+    );
+
+    return {
+        ok: true,
+        invoice,
+        paymentId: paymentResult.insertId,
+        amount: safePaymentAmount,
+        paidAmount: nextPaidAmount,
+        outstandingAmount: Math.max(totalAmount - nextPaidAmount, 0),
+        status: nextStatus,
+        paymentMethod
+    };
+};
+
+const notifyInvoicePayment = async (paymentResult, invoiceId) => {
+    await createNotification(
+        pool,
+        paymentResult.invoice.patientId,
+        paymentResult.status === 'paid' ? 'Thanh toán thành công' : 'Hóa đơn đã được thanh toán một phần',
+        `Hóa đơn #${invoiceId} đã ghi nhận thanh toán ${paymentResult.amount.toLocaleString('vi-VN')} đ.`,
+        'payment'
+    );
+    await createNotificationsForRoles(
+        pool,
+        ['admin', 'staff'],
+        paymentResult.status === 'paid' ? 'Hóa đơn đã thanh toán đủ' : 'Hóa đơn thanh toán một phần',
+        `Hóa đơn #${invoiceId} đã ghi nhận thanh toán ${paymentResult.amount.toLocaleString('vi-VN')} đ.`,
+        'payment'
+    );
+};
+
+const confirmVnpayPaymentFromParams = async (params) => {
+    const invoiceId = parseInvoiceIdFromTxnRef(params.vnp_TxnRef);
+    const validSignature = verifyVnpaySignature(params);
+    const responseCode = String(params.vnp_ResponseCode || '');
+    const transactionStatus = String(params.vnp_TransactionStatus || '');
+    const success = validSignature && responseCode === '00' && transactionStatus === '00';
+
+    const result = {
+        success: false,
+        status: 'failed',
+        invoiceId,
+        responseCode,
+        message: 'Thanh toán VNPay chưa thành công hoặc chữ ký không hợp lệ.'
+    };
+
+    if (!validSignature) {
+        result.message = 'Chữ ký VNPay không hợp lệ.';
+        return result;
+    }
+
+    if (!invoiceId) {
+        result.message = 'Không xác định được hóa đơn từ giao dịch VNPay.';
+        return result;
+    }
+
+    if (!success) {
+        result.message = 'VNPay trả về giao dịch chưa thành công.';
+        return result;
+    }
+
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const paymentAmount = money(params.vnp_Amount) / 100;
+        const transactionId = String(params.vnp_TransactionNo || params.vnp_TxnRef || '');
+        const paymentResult = await recordInvoicePayment(connection, invoiceId, paymentAmount, 'vnpay', transactionId);
+
+        if (paymentResult.ok) {
+            await connection.commit();
+            await notifyInvoicePayment(paymentResult, invoiceId);
+            return {
+                ...result,
+                success: true,
+                status: 'success',
+                message: 'Đã ghi nhận thanh toán VNPay.',
+                payment: paymentResult
+            };
+        }
+
+        await connection.rollback();
+        if (['already_paid', 'already_confirmed'].includes(paymentResult.code)) {
+            return {
+                ...result,
+                success: true,
+                status: 'success',
+                message: 'Giao dịch VNPay đã được ghi nhận trước đó.'
+            };
+        }
+
+        return {
+            ...result,
+            message: paymentResult.message || 'Không thể ghi nhận giao dịch VNPay.'
+        };
+    } catch (error) {
+        await connection.rollback();
+        console.error('VNPay confirmation failed:', error.message);
+        return {
+            ...result,
+            message: 'Không thể ghi nhận giao dịch VNPay.'
+        };
+    } finally {
+        connection.release();
+    }
 };
 
 const getInvoiceItems = async (connectionOrPool, invoiceIds) => {
@@ -316,6 +559,155 @@ const invoiceController = {
         }
     },
 
+    createVnpayPaymentUrl: async (req, res, next) => {
+        try {
+            if (!isVnpayConfigured()) {
+                return res.status(503).json({
+                    success: false,
+                    message: 'Chưa cấu hình VNPay. Vui lòng thêm VNPAY_TMN_CODE và VNPAY_HASH_SECRET trong backend/.env.'
+                });
+            }
+
+            const invoiceId = Number(req.params.id);
+            if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+                return res.status(400).json({ success: false, message: 'ID hóa đơn không hợp lệ.' });
+            }
+
+            let query = 'SELECT id, patientId, status, totalAmount, paidAmount FROM Invoices WHERE id = ?';
+            const params = [invoiceId];
+            if (req.user.role === 'patient') {
+                query += ' AND patientId = ?';
+                params.push(req.user.id);
+            }
+
+            const [invoices] = await pool.query(query, params);
+            if (invoices.length === 0) {
+                return res.status(404).json({ success: false, message: 'Không tìm thấy hóa đơn.' });
+            }
+
+            const invoice = invoices[0];
+            if (invoice.status === 'paid') {
+                return res.status(400).json({ success: false, message: 'Hóa đơn đã thanh toán đủ.' });
+            }
+            if (invoice.status === 'cancelled') {
+                return res.status(400).json({ success: false, message: 'Không thể thanh toán hóa đơn đã hủy.' });
+            }
+
+            const outstandingAmount = Math.max(money(invoice.totalAmount) - money(invoice.paidAmount), 0);
+            const requestedAmount = req.body.amount === undefined ? outstandingAmount : money(req.body.amount);
+            if (requestedAmount <= 0 || requestedAmount > outstandingAmount) {
+                return res.status(400).json({ success: false, message: 'Số tiền thanh toán VNPay không hợp lệ.' });
+            }
+
+            const txnRef = `${invoiceId}-${Date.now()}`;
+            const paymentUrl = process.env.VNPAY_PAYMENT_URL || vnpayDefaultPaymentUrl;
+            const backendUrl = getBackendUrl();
+            const returnUrl = process.env.VNPAY_RETURN_URL || `${backendUrl}/api/invoices/vnpay-return`;
+
+            const vnpParams = sortVnpayParams({
+                vnp_Version: '2.1.0',
+                vnp_Command: 'pay',
+                vnp_TmnCode: process.env.VNPAY_TMN_CODE,
+                vnp_Amount: Math.round(requestedAmount * 100),
+                vnp_CurrCode: 'VND',
+                vnp_TxnRef: txnRef,
+                vnp_OrderInfo: `Thanh toan hoa don ${invoiceId}`,
+                vnp_OrderType: process.env.VNPAY_ORDER_TYPE || 'billpayment',
+                vnp_Locale: 'vn',
+                vnp_ReturnUrl: returnUrl,
+                vnp_IpAddr: getClientIp(req),
+                vnp_CreateDate: formatVnpayDate(),
+                vnp_ExpireDate: getVnpayExpireDate()
+            });
+
+            const secureHash = signVnpayParams(vnpParams);
+            const redirectUrl = `${paymentUrl}?${buildVnpayQuery({ ...vnpParams, vnp_SecureHash: secureHash })}`;
+
+            res.json({
+                success: true,
+                message: 'Tạo link thanh toán VNPay thành công.',
+                data: {
+                    paymentUrl: redirectUrl,
+                    txnRef,
+                    invoiceId,
+                    amount: requestedAmount
+                }
+            });
+        } catch (error) {
+            next(error);
+        }
+    },
+
+    handleVnpayReturn: async (req, res) => {
+        const confirmation = await confirmVnpayPaymentFromParams(req.query);
+        const frontendUrl = getFrontendUrl();
+        const params = new URLSearchParams({
+            payment: confirmation.status,
+            method: 'vnpay',
+            invoiceId: confirmation.invoiceId ? String(confirmation.invoiceId) : '',
+            responseCode: String(req.query.vnp_ResponseCode || '')
+        });
+
+        res.redirect(`${frontendUrl}/profile?${params.toString()}`);
+    },
+
+    confirmVnpayReturn: async (req, res) => {
+        const confirmation = await confirmVnpayPaymentFromParams(req.body || {});
+        res.status(confirmation.success ? 200 : 400).json({
+            success: confirmation.success,
+            message: confirmation.message,
+            data: {
+                status: confirmation.status,
+                invoiceId: confirmation.invoiceId,
+                responseCode: confirmation.responseCode
+            }
+        });
+    },
+
+    handleVnpayIpn: async (req, res, next) => {
+        const connection = await pool.getConnection();
+        try {
+            if (!verifyVnpaySignature(req.query)) {
+                return res.json({ RspCode: '97', Message: 'Invalid Checksum' });
+            }
+
+            const invoiceId = parseInvoiceIdFromTxnRef(req.query.vnp_TxnRef);
+            if (!invoiceId) {
+                return res.json({ RspCode: '01', Message: 'Order not found' });
+            }
+
+            const responseCode = String(req.query.vnp_ResponseCode || '');
+            const transactionStatus = String(req.query.vnp_TransactionStatus || '');
+            if (responseCode !== '00' || transactionStatus !== '00') {
+                return res.json({ RspCode: '00', Message: 'Confirm Success' });
+            }
+
+            const paymentAmount = money(req.query.vnp_Amount) / 100;
+            const transactionId = String(req.query.vnp_TransactionNo || req.query.vnp_TxnRef || '');
+
+            await connection.beginTransaction();
+            const paymentResult = await recordInvoicePayment(connection, invoiceId, paymentAmount, 'vnpay', transactionId);
+
+            if (!paymentResult.ok) {
+                await connection.rollback();
+                if (paymentResult.code === 'not_found') return res.json({ RspCode: '01', Message: 'Order not found' });
+                if (paymentResult.code === 'invalid_amount') return res.json({ RspCode: '04', Message: 'Invalid amount' });
+                if (['already_paid', 'already_confirmed'].includes(paymentResult.code)) return res.json({ RspCode: '02', Message: 'Order already confirmed' });
+                return res.json({ RspCode: '99', Message: 'Unknown error' });
+            }
+
+            await connection.commit();
+            await notifyInvoicePayment(paymentResult, invoiceId);
+
+            res.json({ RspCode: '00', Message: 'Confirm Success' });
+        } catch (error) {
+            await connection.rollback();
+            next(error);
+        } finally {
+            connection.release();
+        }
+    },
+
     payInvoice: async (req, res, next) => {
         const connection = await pool.getConnection();
 
@@ -358,52 +750,26 @@ const invoiceController = {
             const paidAmount = money(invoice.paidAmount);
             const outstandingAmount = Math.max(totalAmount - paidAmount, 0);
             const paymentAmount = requestedAmount === null ? outstandingAmount : requestedAmount;
+            const paymentResult = await recordInvoicePayment(connection, invoiceId, paymentAmount, paymentMethod, transactionId || `manual-${invoiceId}-${Date.now()}`);
 
-            if (paymentAmount <= 0 || paymentAmount > outstandingAmount) {
+            if (!paymentResult.ok) {
                 await connection.rollback();
-                return res.status(400).json({ success: false, message: 'Số tiền thanh toán không hợp lệ.' });
+                return res.status(400).json({ success: false, message: paymentResult.message });
             }
 
-            const nextPaidAmount = paidAmount + paymentAmount;
-            const nextStatus = nextPaidAmount >= totalAmount ? 'paid' : 'partial';
-
-            await connection.query(
-                'UPDATE Invoices SET status = ?, paidAmount = ?, paymentMethod = ? WHERE id = ?',
-                [nextStatus, nextPaidAmount, toInvoicePaymentMethod(paymentMethod), invoiceId]
-            );
-
-            const [paymentResult] = await connection.query(
-                'INSERT INTO Payments (invoiceId, amount, paymentMethod, transactionId, status) VALUES (?, ?, ?, ?, "success")',
-                [invoiceId, paymentAmount, paymentMethod, transactionId || null]
-            );
-
             await connection.commit();
-
-            await createNotification(
-                pool,
-                invoice.patientId,
-                nextStatus === 'paid' ? 'Thanh toán thành công' : 'Hóa đơn đã được thanh toán một phần',
-                `Hóa đơn #${invoiceId} đã ghi nhận thanh toán ${paymentAmount.toLocaleString('vi-VN')} đ.`,
-                'payment'
-            );
-            await createNotificationsForRoles(
-                pool,
-                ['admin', 'staff'],
-                nextStatus === 'paid' ? 'Hóa đơn đã thanh toán đủ' : 'Hóa đơn thanh toán một phần',
-                `Hóa đơn #${invoiceId} đã ghi nhận thanh toán ${paymentAmount.toLocaleString('vi-VN')} đ.`,
-                'payment'
-            );
+            await notifyInvoicePayment(paymentResult, invoiceId);
 
             res.json({
                 success: true,
-                message: nextStatus === 'paid' ? 'Thanh toán hóa đơn thành công.' : 'Đã ghi nhận thanh toán một phần.',
+                message: paymentResult.status === 'paid' ? 'Thanh toán hóa đơn thành công.' : 'Đã ghi nhận thanh toán một phần.',
                 data: {
-                    paymentId: paymentResult.insertId,
+                    paymentId: paymentResult.paymentId,
                     invoiceId,
-                    amount: paymentAmount,
-                    paidAmount: nextPaidAmount,
-                    outstandingAmount: Math.max(totalAmount - nextPaidAmount, 0),
-                    status: nextStatus,
+                    amount: paymentResult.amount,
+                    paidAmount: paymentResult.paidAmount,
+                    outstandingAmount: paymentResult.outstandingAmount,
+                    status: paymentResult.status,
                     paymentMethod
                 }
             });
