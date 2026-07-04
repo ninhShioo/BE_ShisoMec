@@ -203,11 +203,19 @@ const runCompatibilityMigrations = async (connection) => {
     await addColumnIfMissing(connection, 'MedicalRecords', 'toothPositions', 'TEXT');
     await addColumnIfMissing(connection, 'MedicalRecords', 'nextAppointmentDate', 'DATE NULL');
     await addColumnIfMissing(connection, 'MedicalRecords', 'nextAppointmentNote', 'TEXT');
+    await addColumnIfMissing(connection, 'MedicalRecords', 'nextAppointmentReminderSentAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'MedicalRecords', 'nextAppointmentEmailReminderSentAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'ChatMessages', 'readAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'ChatMessages', 'isAssistant', 'TINYINT(1) DEFAULT 0');
+    await addColumnIfMissing(connection, 'ChatMessages', 'assistantName', 'VARCHAR(120) DEFAULT NULL');
+    await addColumnIfMissing(connection, 'ChatMessages', 'metadata', 'TEXT');
+    await addColumnIfMissing(connection, 'ChatConversations', 'needsStaff', 'TINYINT(1) DEFAULT 0');
+    await addColumnIfMissing(connection, 'ChatConversations', 'priorityReason', 'VARCHAR(255) DEFAULT NULL');
     await addColumnIfMissing(connection, 'Promotions', 'name', "VARCHAR(150) NOT NULL DEFAULT 'Khuyến mãi'");
     await addColumnIfMissing(connection, 'Promotions', 'description', 'TEXT');
     await addColumnIfMissing(connection, 'Promotions', 'isActive', 'TINYINT(1) DEFAULT 1');
     await addColumnIfMissing(connection, 'Appointments', 'confirmationReminderSentAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Appointments', 'appointmentReminderEmailSentAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'Appointments', 'statusChangedAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'Appointments', 'checkedInAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'Appointments', 'startedAt', 'TIMESTAMP NULL');
@@ -224,6 +232,7 @@ const runCompatibilityMigrations = async (connection) => {
     await addColumnIfMissing(connection, 'Invoices', 'note', 'TEXT');
     await addColumnIfMissing(connection, 'Invoices', 'cancelledReason', 'TEXT');
     await addColumnIfMissing(connection, 'Users', 'passwordChangedAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Users', 'googleLinkedAt', 'TIMESTAMP NULL');
 
     await connection.query(`
         ALTER TABLE Appointments

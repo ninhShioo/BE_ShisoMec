@@ -7,6 +7,7 @@ const logActivity = require('../middlewares/activityLogger');
 router.use(verifyToken);
 
 router.post('/', checkRole(['dentist', 'admin']), logActivity('CREATE_MEDICAL_RECORD', 'MedicalRecords'), medicalRecordController.createRecord);
+router.get('/', checkRole(['dentist', 'admin', 'staff']), medicalRecordController.getRecords);
 router.get('/patient/:patientId', checkRole(['patient', 'dentist', 'admin', 'staff']), medicalRecordController.getRecordsByPatient);
 
 module.exports = router;

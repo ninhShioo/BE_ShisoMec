@@ -97,6 +97,104 @@ const mapRecord = (record) => ({
 });
 
 const medicalRecordController = {
+    getRecords: async (req, res, next) => {
+        try {
+            if (!['admin', 'staff', 'dentist'].includes(req.user.role)) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Bạn không có quyền xem danh sách hồ sơ khám.'
+                });
+            }
+
+            const { search = '', dentistId = '', patientId = '', dateFrom = '', dateTo = '', followUp = '' } = req.query;
+            const conditions = [];
+            const params = [];
+
+            if (req.user.role === 'dentist') {
+                conditions.push('m.dentistId = ?');
+                params.push(req.user.id);
+            } else if (dentistId && dentistId !== 'all') {
+                conditions.push('m.dentistId = ?');
+                params.push(Number(dentistId));
+            }
+
+            if (patientId && patientId !== 'all') {
+                conditions.push('m.patientId = ?');
+                params.push(Number(patientId));
+            }
+
+            if (dateFrom) {
+                conditions.push('a.appointmentDate >= ?');
+                params.push(normalizeDate(dateFrom));
+            }
+
+            if (dateTo) {
+                conditions.push('a.appointmentDate <= ?');
+                params.push(normalizeDate(dateTo));
+            }
+
+            if (followUp === 'due') {
+                conditions.push('m.nextAppointmentDate IS NOT NULL AND m.nextAppointmentDate <= CURDATE()');
+            } else if (followUp === 'upcoming') {
+                conditions.push('m.nextAppointmentDate IS NOT NULL AND m.nextAppointmentDate > CURDATE()');
+            }
+
+            const keyword = String(search || '').trim();
+            if (keyword) {
+                conditions.push(`(
+                    p.fullName LIKE ?
+                    OR p.phone LIKE ?
+                    OR p.email LIKE ?
+                    OR d.fullName LIKE ?
+                    OR m.diagnosis LIKE ?
+                    OR m.chiefComplaint LIKE ?
+                    OR m.treatmentPlan LIKE ?
+                    OR m.procedures LIKE ?
+                )`);
+                const pattern = `%${keyword}%`;
+                params.push(pattern, pattern, pattern, pattern, pattern, pattern, pattern, pattern);
+            }
+
+            const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+            const [records] = await pool.query(
+                `SELECT
+                    m.id, m.appointmentId, m.patientId, m.dentistId, m.diagnosis, m.chiefComplaint,
+                    m.treatmentPlan, m.treatmentSessions, m.toothPositions, m.procedures,
+                    m.prescription, m.notes, m.nextAppointmentDate, m.nextAppointmentNote,
+                    m.nextAppointmentReminderSentAt, m.nextAppointmentEmailReminderSentAt,
+                    m.attachments, m.createdAt, m.updatedAt,
+                    a.appointmentDate, a.appointmentTime,
+                    p.fullName as patientName, p.phone as patientPhone, p.email as patientEmail,
+                    d.fullName as dentistName,
+                    svc.serviceNames
+                 FROM MedicalRecords m
+                 JOIN Appointments a ON m.appointmentId = a.id
+                 JOIN Users p ON m.patientId = p.id
+                 JOIN Users d ON m.dentistId = d.id
+                 LEFT JOIN (
+                    SELECT
+                        asv.appointmentId,
+                        GROUP_CONCAT(s.name ORDER BY s.name SEPARATOR ', ') as serviceNames
+                    FROM Appointment_Services asv
+                    JOIN Services s ON asv.serviceId = s.id
+                    GROUP BY asv.appointmentId
+                 ) svc ON svc.appointmentId = a.id
+                 ${whereClause}
+                 ORDER BY a.appointmentDate DESC, a.appointmentTime DESC, m.createdAt DESC
+                 LIMIT 200`,
+                params
+            );
+
+            res.json({
+                success: true,
+                message: 'Lấy danh sách hồ sơ khám thành công.',
+                data: records.map(mapRecord)
+            });
+        } catch (error) {
+            next(error);
+        }
+    },
+
     createRecord: async (req, res, next) => {
         const connection = await pool.getConnection();
 
@@ -258,7 +356,8 @@ const medicalRecordController = {
                 SELECT
                     m.id, m.appointmentId, m.diagnosis, m.chiefComplaint, m.treatmentPlan, m.treatmentSessions,
                     m.toothPositions, m.procedures,
-                    m.prescription, m.notes, m.nextAppointmentDate, m.nextAppointmentNote, m.attachments,
+                    m.prescription, m.notes, m.nextAppointmentDate, m.nextAppointmentNote,
+                    m.nextAppointmentReminderSentAt, m.nextAppointmentEmailReminderSentAt, m.attachments,
                     m.createdAt, m.updatedAt,
                     a.appointmentDate, a.appointmentTime,
                     d.fullName as dentistName,

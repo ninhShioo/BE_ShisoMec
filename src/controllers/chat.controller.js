@@ -29,6 +29,8 @@ const chatController = {
                     u.phone,
                     conv.id as conversationId,
                     COALESCE(conv.status, "new") as conversationStatus,
+                    COALESCE(conv.needsStaff, 0) as needsStaff,
+                    conv.priorityReason,
                     conv.assignedTo,
                     assignee.fullName as assignedToName,
                     MAX(c.createdAt) as lastMessageAt,
@@ -43,8 +45,9 @@ const chatController = {
                 LEFT JOIN ChatConversations conv ON conv.patientId = u.id
                 LEFT JOIN Users assignee ON assignee.id = conv.assignedTo
                 WHERE u.role = "patient"
-                GROUP BY u.id, u.fullName, u.email, u.phone, conv.id, conv.status, conv.assignedTo, assignee.fullName
+                GROUP BY u.id, u.fullName, u.email, u.phone, conv.id, conv.status, conv.needsStaff, conv.priorityReason, conv.assignedTo, assignee.fullName
                 ORDER BY
+                    COALESCE(conv.needsStaff, 0) DESC,
                     CASE COALESCE(conv.status, "new")
                         WHEN "new" THEN 1
                         WHEN "open" THEN 2
@@ -93,7 +96,17 @@ const chatController = {
             }
 
             const [messages] = await pool.query(
-                `SELECT c.id, c.senderId, c.receiverId, c.message, c.readAt, c.createdAt, u.fullName as senderName, u.role
+                `SELECT
+                    c.id,
+                    c.senderId,
+                    c.receiverId,
+                    c.message,
+                    c.readAt,
+                    c.createdAt,
+                    c.isAssistant,
+                    c.metadata,
+                    IF(c.isAssistant = 1, COALESCE(c.assistantName, 'Trợ lý Phenikaa Dental'), u.fullName) as senderName,
+                    IF(c.isAssistant = 1, 'assistant', u.role) as role
                  FROM ChatMessages c
                  JOIN Users u ON c.senderId = u.id
                  WHERE c.senderId = ? OR c.receiverId = ?
@@ -142,9 +155,11 @@ const chatController = {
                 `UPDATE ChatConversations
                  SET status = COALESCE(?, status),
                      assignedTo = ?,
+                     needsStaff = IF(? = "closed", 0, needsStaff),
+                     priorityReason = IF(? = "closed", NULL, priorityReason),
                      closedAt = IF(? = "closed", NOW(), NULL)
                  WHERE patientId = ?`,
-                [status || null, targetAssignee, status || null, patientId]
+                [status || null, targetAssignee, status || null, status || null, status || null, patientId]
             );
 
             res.json({ success: true, message: 'Đã cập nhật hội thoại.' });

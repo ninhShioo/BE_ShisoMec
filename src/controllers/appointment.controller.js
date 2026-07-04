@@ -1,5 +1,6 @@
 const pool = require('../config/database');
 const { createNotification, createNotificationsForRoles } = require('../services/notification.service');
+const { sendReleasedSlotOfferEmail } = require('../services/email.service');
 
 const validAppointmentStatuses = ['pending', 'confirmed', 'arrived', 'in_progress', 'completed', 'cancelled', 'no_show'];
 const terminalAppointmentStatuses = ['completed', 'cancelled', 'no_show'];
@@ -23,6 +24,107 @@ const buildAppointmentDateTime = (appointmentDate, appointmentTime) => {
     const appointmentDateTime = new Date(`${appointmentDate}T${normalizedTime}`);
 
     return Number.isNaN(appointmentDateTime.getTime()) ? null : appointmentDateTime;
+};
+
+const getSlotReleaseWindowDays = () => {
+    const value = Number(process.env.SLOT_RELEASE_NOTIFY_WINDOW_DAYS || 14);
+    return Number.isFinite(value) && value > 0 ? Math.min(value, 60) : 14;
+};
+
+const getSlotReleaseLimit = () => {
+    const value = Number(process.env.SLOT_RELEASE_NOTIFY_LIMIT || 8);
+    return Number.isFinite(value) && value > 0 ? Math.min(value, 30) : 8;
+};
+
+const formatDateTimeForMessage = (appointment) => {
+    const date = normalizeDateValue(appointment.appointmentDate);
+    const time = String(appointment.appointmentTime || '').slice(0, 5);
+    return `${time} ngày ${date.split('-').reverse().join('/')}`;
+};
+
+const findReleasedSlotCandidates = async (connection, releasedAppointment) => {
+    if (!releasedAppointment?.dentistId) return [];
+
+    const releasedDate = normalizeDateValue(releasedAppointment.appointmentDate);
+    const releasedTime = String(releasedAppointment.appointmentTime || '').slice(0, 8);
+    const releasedDateTime = buildAppointmentDateTime(releasedDate, releasedTime);
+    if (!releasedDateTime || releasedDateTime <= new Date()) return [];
+
+    const [candidates] = await connection.query(
+        `SELECT
+            a.id,
+            a.patientId,
+            a.dentistId,
+            a.appointmentDate,
+            a.appointmentTime,
+            p.fullName as patientName,
+            p.email as patientEmail,
+            d.fullName as dentistName,
+            svc.serviceNames
+         FROM Appointments a
+         JOIN Users p ON p.id = a.patientId
+         LEFT JOIN Users d ON d.id = a.dentistId
+         LEFT JOIN (
+            SELECT
+                asv.appointmentId,
+                GROUP_CONCAT(s.name ORDER BY s.name SEPARATOR ', ') as serviceNames
+            FROM Appointment_Services asv
+            JOIN Services s ON s.id = asv.serviceId
+            GROUP BY asv.appointmentId
+         ) svc ON svc.appointmentId = a.id
+         WHERE a.id <> ?
+           AND a.patientId <> ?
+           AND a.dentistId = ?
+           AND a.status IN ("pending", "confirmed")
+           AND CONCAT(a.appointmentDate, " ", a.appointmentTime) > CONCAT(?, " ", ?)
+           AND CONCAT(a.appointmentDate, " ", a.appointmentTime) <= DATE_ADD(CONCAT(?, " ", ?), INTERVAL ? DAY)
+         ORDER BY a.appointmentDate ASC, a.appointmentTime ASC
+         LIMIT ?`,
+        [
+            releasedAppointment.id,
+            releasedAppointment.patientId,
+            releasedAppointment.dentistId,
+            releasedDate,
+            releasedTime,
+            releasedDate,
+            releasedTime,
+            getSlotReleaseWindowDays(),
+            getSlotReleaseLimit()
+        ]
+    );
+
+    return candidates;
+};
+
+const notifyReleasedSlotCandidates = async (connection, releasedAppointment) => {
+    const candidates = await findReleasedSlotCandidates(connection, releasedAppointment);
+    if (candidates.length === 0) return [];
+
+    const releasedSlot = {
+        ...releasedAppointment,
+        dentistName: candidates[0]?.dentistName || releasedAppointment.dentistName || ''
+    };
+    const releasedText = formatDateTimeForMessage(releasedSlot);
+
+    for (const candidate of candidates) {
+        await createNotification(
+            connection,
+            candidate.patientId,
+            'Có khung giờ khám sớm hơn',
+            `Slot ${releasedText}${releasedSlot.dentistName ? ` với ${releasedSlot.dentistName}` : ''} vừa trống. Lịch hẹn #${candidate.id} của bạn đang ở ${formatDateTimeForMessage(candidate)}. Nếu muốn đổi lịch, vui lòng yêu cầu dời lịch hoặc liên hệ hotline.`,
+            'appointment'
+        );
+    }
+
+    return candidates.map((candidate) => ({
+        recipient: {
+            id: candidate.patientId,
+            fullName: candidate.patientName,
+            email: candidate.patientEmail
+        },
+        releasedSlot,
+        currentAppointment: candidate
+    }));
 };
 
 const getBookingLeadHours = async (connection) => {
@@ -812,6 +914,7 @@ const appointmentController = {
 
     updateAppointmentStatus: async (req, res, next) => {
         const connection = await pool.getConnection();
+        let releasedSlotEmailJobs = [];
         try {
             const { id } = req.params;
             const { status, reason, note } = req.body;
@@ -897,13 +1000,25 @@ const appointmentController = {
                     `Lịch hẹn #${id} đã bị hủy${reason ? `: ${reason}` : '.'}`,
                     'appointment'
                 );
+
+                releasedSlotEmailJobs = await notifyReleasedSlotCandidates(connection, appt);
             }
 
             await connection.commit();
 
+            if (releasedSlotEmailJobs.length > 0) {
+                const emailResults = await Promise.allSettled(
+                    releasedSlotEmailJobs.map((job) => sendReleasedSlotOfferEmail(job))
+                );
+                const failedEmails = emailResults.filter((result) => result.status === 'rejected');
+                if (failedEmails.length > 0) {
+                    console.warn(`Released slot email failed for ${failedEmails.length} recipient(s).`);
+                }
+            }
+
             res.json({
                 success: true,
-                message: `Đã chuyển lịch hẹn sang trạng thái "${statusLabels[status] || status}".`
+                message: `Đã chuyển lịch hẹn sang trạng thái "${statusLabels[status] || status}"${releasedSlotEmailJobs.length ? ` và đã báo ${releasedSlotEmailJobs.length} khách có lịch sắp tới.` : ''}.`
             });
         } catch (error) {
             await connection.rollback();

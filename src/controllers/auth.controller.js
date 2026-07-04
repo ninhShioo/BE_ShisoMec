@@ -177,12 +177,12 @@ const authController = {
                 const randomPassword = crypto.randomBytes(32).toString('hex');
                 const hashedPassword = await bcrypt.hash(randomPassword, 12);
                 const [result] = await pool.query(
-                    'INSERT INTO Users (fullName, email, password, phone, role, avatar) VALUES (?, ?, ?, NULL, "patient", ?)',
+                    'INSERT INTO Users (fullName, email, password, phone, role, avatar, googleLinkedAt) VALUES (?, ?, ?, NULL, "patient", ?, NOW())',
                     [googleUser.fullName || googleUser.email, googleUser.email, hashedPassword, googleUser.avatar]
                 );
 
                 const [createdUsers] = await pool.query(
-                    'SELECT id, fullName, email, phone, role, status, avatar, createdAt FROM Users WHERE id = ? LIMIT 1',
+                    'SELECT id, fullName, email, phone, role, status, avatar, createdAt, googleLinkedAt FROM Users WHERE id = ? LIMIT 1',
                     [result.insertId]
                 );
                 user = createdUsers[0];
@@ -193,8 +193,10 @@ const authController = {
                 }
 
                 if (!user.avatar && googleUser.avatar) {
-                    await pool.query('UPDATE Users SET avatar = ? WHERE id = ?', [googleUser.avatar, user.id]);
+                    await pool.query('UPDATE Users SET avatar = ?, googleLinkedAt = COALESCE(googleLinkedAt, NOW()) WHERE id = ?', [googleUser.avatar, user.id]);
                     user.avatar = googleUser.avatar;
+                } else {
+                    await pool.query('UPDATE Users SET googleLinkedAt = COALESCE(googleLinkedAt, NOW()) WHERE id = ?', [user.id]);
                 }
             }
 

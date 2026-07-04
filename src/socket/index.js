@@ -4,6 +4,10 @@ const pool = require('../config/database');
 const { getCorsOrigins } = require('../config/env');
 const { setSocketServer } = require('./emitter');
 const chatController = require('../controllers/chat.controller');
+const { ASSISTANT_NAME, buildAssistantResponse, getAssistantSenderId } = require('../services/chatAssistant.service');
+const { createNotification, createNotificationsForRoles } = require('../services/notification.service');
+
+const staffChatNotificationTitle = 'Khach can ho tro chat';
 
 const initSocket = (server) => {
     const io = new Server(server, {
@@ -100,8 +104,92 @@ const initSocket = (server) => {
 
                 io.to(`chat:patient:${patientRoomId}`).emit('receive_message', payload);
                 io.to('chat:staff').emit('receive_message', { ...payload, patientId: patientRoomId });
+
+                if ((socket.user.role === 'staff' || socket.user.role === 'admin') && receiverId) {
+                    await createNotification(
+                        pool,
+                        receiverId,
+                        'Tin nhan moi tu phong kham',
+                        `${socket.user.fullName}: ${message.slice(0, 120)}`,
+                        'chat'
+                    );
+                }
+
+                if (socket.user.role === 'patient') {
+                    const assistantSenderId = await getAssistantSenderId();
+                    if (!assistantSenderId) return;
+
+                    io.to(`chat:patient:${patientRoomId}`).emit('assistant_typing', { typing: true });
+
+                    const response = await buildAssistantResponse(message, { patientId: socket.user.id, user: socket.user });
+                    if (!response?.message) return;
+                    const metadata = JSON.stringify(response.metadata || {});
+
+                    if (response.needsStaff) {
+                        await pool.query(
+                            `UPDATE ChatConversations
+                             SET needsStaff = 1,
+                                 priorityReason = ?,
+                                 status = IF(status = "closed", "open", status),
+                                 updatedAt = CURRENT_TIMESTAMP
+                             WHERE patientId = ?`,
+                            [response.priorityReason || 'Cần nhân viên hỗ trợ.', socket.user.id]
+                        );
+
+                        const [recentNotifications] = await pool.query(
+                            `SELECT id
+                             FROM Notifications
+                             WHERE type = "chat"
+                               AND title = ?
+                               AND message LIKE ?
+                               AND createdAt >= DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+                             LIMIT 1`,
+                            [staffChatNotificationTitle, `%${socket.user.fullName}%`]
+                        );
+
+                        if (recentNotifications.length === 0) {
+                            await createNotificationsForRoles(
+                                pool,
+                                ['staff', 'admin'],
+                                staffChatNotificationTitle,
+                                `${socket.user.fullName} cần nhân viên hỗ trợ qua chat. ${response.priorityReason || ''}`.trim(),
+                                'chat'
+                            );
+                        }
+                    }
+
+                    const [assistantResult] = await pool.query(
+                        `INSERT INTO ChatMessages (senderId, receiverId, message, isAssistant, assistantName, metadata, readAt)
+                         VALUES (?, ?, ?, 1, ?, ?, ?)`,
+                        [assistantSenderId, socket.user.id, response.message, ASSISTANT_NAME, metadata, null]
+                    );
+
+                    const assistantPayload = {
+                        id: assistantResult.insertId,
+                        senderId: assistantSenderId,
+                        receiverId: socket.user.id,
+                        senderName: ASSISTANT_NAME,
+                        role: 'assistant',
+                        message: response.message,
+                        isAssistant: 1,
+                        metadata,
+                        createdAt: new Date()
+                    };
+
+                    io.to(`chat:patient:${patientRoomId}`).emit('assistant_typing', { typing: false });
+                    io.to(`chat:patient:${patientRoomId}`).emit('receive_message', assistantPayload);
+                    io.to('chat:staff').emit('receive_message', {
+                        ...assistantPayload,
+                        patientId: patientRoomId,
+                        needsStaff: response.needsStaff,
+                        priorityReason: response.priorityReason
+                    });
+                }
             } catch (error) {
                 console.error('Socket send_message error:', error.message);
+                if (socket.user.role === 'patient') {
+                    io.to(`chat:patient:${socket.user.id}`).emit('assistant_typing', { typing: false });
+                }
             }
         });
 
