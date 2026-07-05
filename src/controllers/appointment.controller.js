@@ -474,7 +474,8 @@ const appointmentController = {
             const targetDentistId = Number(dentistId);
             const serviceIds = normalizeQueryServiceIds(req.query.serviceIds);
             const requestedDuration = await getServiceDuration(pool, serviceIds);
-            const bookingLeadHours = await getBookingLeadHours(pool);
+            const canUsePastSlots = req.user.role === 'admin';
+            const bookingLeadHours = canUsePastSlots ? 0 : await getBookingLeadHours(pool);
 
             if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) {
                 return res.status(400).json({ success: false, message: 'Ngày khám không hợp lệ.' });
@@ -536,7 +537,7 @@ const appointmentController = {
                 const outsideWorkingHours = slotEnd > end;
                 const inBreak = breakStart !== null && breakEnd !== null && rangesOverlap(minutes, slotEnd, breakStart, breakEnd);
                 const dateTime = new Date(`${date}T${time}:00`);
-                const isPast = dateTime < getEarliestBookableDateTime(bookingLeadHours);
+                const isPast = !canUsePastSlots && dateTime < getEarliestBookableDateTime(bookingLeadHours);
                 const isBooked = busyRanges.some((range) => rangesOverlap(minutes, slotEnd, range.start, range.end));
 
                 slots.push({
@@ -598,7 +599,8 @@ const appointmentController = {
             }
 
             const bookingLeadHours = policySettings.bookingLeadHours;
-            if (appointmentDateTime < getEarliestBookableDateTime(bookingLeadHours)) {
+            const canCreatePastAppointment = req.user.role === 'admin';
+            if (!canCreatePastAppointment && appointmentDateTime < getEarliestBookableDateTime(bookingLeadHours)) {
                 throw new Error(`Cần đặt lịch trước ít nhất ${bookingLeadHours} giờ.`);
             }
 
@@ -1190,7 +1192,8 @@ const appointmentController = {
             }
 
             const bookingLeadHours = policySettings.bookingLeadHours;
-            if (appointmentDateTime < getEarliestBookableDateTime(bookingLeadHours)) {
+            const canRescheduleToPast = req.user.role === 'admin';
+            if (!canRescheduleToPast && appointmentDateTime < getEarliestBookableDateTime(bookingLeadHours)) {
                 await connection.rollback();
                 return res.status(400).json({ success: false, message: `Cần đặt lịch trước ít nhất ${bookingLeadHours} giờ.` });
             }
