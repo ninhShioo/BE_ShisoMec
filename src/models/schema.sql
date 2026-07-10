@@ -225,6 +225,7 @@ CREATE TABLE IF NOT EXISTS ChatConversations (
     status ENUM('new', 'open', 'closed') DEFAULT 'new',
     needsStaff TINYINT(1) DEFAULT 0,
     priorityReason VARCHAR(255),
+    assistantState TEXT,
     closedAt TIMESTAMP NULL,
     createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -323,4 +324,48 @@ CREATE TABLE IF NOT EXISTS Settings (
     settingKey VARCHAR(100) UNIQUE NOT NULL,
     settingValue TEXT,
     updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS AiKnowledge (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(150) NOT NULL,
+    category VARCHAR(80) DEFAULT 'general',
+    keywords TEXT,
+    answer TEXT NOT NULL,
+    isActive TINYINT(1) DEFAULT 1,
+    createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_ai_knowledge_active (isActive, category)
+);
+
+CREATE TABLE IF NOT EXISTS AiTrainingSamples (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    patientId INT NULL,
+    userMessage TEXT NOT NULL,
+    assistantReply TEXT,
+    intent VARCHAR(80) DEFAULT 'general',
+    reviewReason VARCHAR(255),
+    status ENUM('pending', 'used', 'ignored') DEFAULT 'pending',
+    knowledgeId INT NULL,
+    createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    reviewedAt TIMESTAMP NULL,
+    reviewedBy INT NULL,
+    FOREIGN KEY (patientId) REFERENCES Users(id) ON DELETE SET NULL,
+    FOREIGN KEY (knowledgeId) REFERENCES AiKnowledge(id) ON DELETE SET NULL,
+    FOREIGN KEY (reviewedBy) REFERENCES Users(id) ON DELETE SET NULL,
+    INDEX idx_ai_training_samples_status (status, createdAt)
+);
+
+CREATE TABLE IF NOT EXISTS AiFeedback (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    messageId INT NOT NULL,
+    userId INT NOT NULL,
+    rating ENUM('helpful', 'unhelpful') NOT NULL,
+    comment TEXT,
+    createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_ai_feedback_message_user (messageId, userId),
+    FOREIGN KEY (messageId) REFERENCES ChatMessages(id) ON DELETE CASCADE,
+    FOREIGN KEY (userId) REFERENCES Users(id) ON DELETE CASCADE,
+    INDEX idx_ai_feedback_rating (rating, createdAt)
 );

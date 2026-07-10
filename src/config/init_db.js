@@ -72,6 +72,25 @@ const addForeignKeyIfMissing = async (connection, constraintName, sql) => {
     }
 };
 
+const seedAiKnowledge = async (connection) => {
+    const [[countRow]] = await connection.query('SELECT COUNT(*) as count FROM AiKnowledge');
+    if (Number(countRow?.count || 0) > 0) return;
+
+    const items = [
+        ['Đặt lịch qua AI', 'booking', 'muốn đặt lịch,đặt lịch giúp,đăng ký khám,hẹn bác sĩ,cần khám,khám răng', 'Mình có thể đặt lịch hộ bạn ngay trong chat. Mình sẽ hỏi dịch vụ hoặc triệu chứng, ngày khám, bác sĩ mong muốn và khung giờ phù hợp.'],
+        ['Khám lần đầu', 'procedure', 'lần đầu đi khám,cần mang gì,chuẩn bị gì,đi khám lần đầu', 'Nếu khám lần đầu, bạn nên mang giấy tờ tùy thân, phim/chẩn đoán cũ nếu có, danh sách thuốc đang dùng và đến sớm vài phút để lễ tân check-in.'],
+        ['Đến muộn', 'appointment', 'đến muộn,trễ giờ,quá giờ hẹn,tôi bị trễ', 'Nếu có thể đến muộn, bạn nên báo lễ tân qua hotline. Phòng khám sẽ kiểm tra khả năng giữ lịch hoặc hỗ trợ đổi sang khung giờ phù hợp.'],
+        ['Chi phí điều trị', 'payment', 'giá bao nhiêu,chi phí,báo giá,có đắt không,tính tiền thế nào', 'Chi phí phụ thuộc tình trạng răng thực tế, dịch vụ cần làm và kế hoạch điều trị. Hệ thống có thể gợi ý giá dịch vụ, nhưng bác sĩ sẽ xác nhận sau khi thăm khám.'],
+        ['Gặp nhân viên', 'support', 'gặp nhân viên,gặp lễ tân,cần người tư vấn,nói chuyện với người thật', 'Mình sẽ chuyển hội thoại sang nhóm cần nhân viên hỗ trợ để lễ tân/admin nhìn thấy và phản hồi cho bạn.']
+    ];
+
+    await connection.query(
+        'INSERT INTO AiKnowledge (title, category, keywords, answer) VALUES ?',
+        [items]
+    );
+    console.log('Seeded default AI knowledge');
+};
+
 const runCompatibilityMigrations = async (connection) => {
     await connection.query(`
         CREATE TABLE IF NOT EXISTS DoctorSchedules (
@@ -173,6 +192,7 @@ const runCompatibilityMigrations = async (connection) => {
             patientId INT NOT NULL UNIQUE,
             assignedTo INT,
             status ENUM('new', 'open', 'closed') DEFAULT 'new',
+            assistantState TEXT,
             closedAt TIMESTAMP NULL,
             createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -192,6 +212,54 @@ const runCompatibilityMigrations = async (connection) => {
             FOREIGN KEY (userId) REFERENCES Users(id) ON DELETE CASCADE
         )
     `);
+    await connection.query(`
+        CREATE TABLE IF NOT EXISTS AiKnowledge (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            title VARCHAR(150) NOT NULL,
+            category VARCHAR(80) DEFAULT 'general',
+            keywords TEXT,
+            answer TEXT NOT NULL,
+            isActive TINYINT(1) DEFAULT 1,
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_ai_knowledge_active (isActive, category)
+        )
+    `);
+    await connection.query(`
+        CREATE TABLE IF NOT EXISTS AiTrainingSamples (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            patientId INT NULL,
+            userMessage TEXT NOT NULL,
+            assistantReply TEXT,
+            intent VARCHAR(80) DEFAULT 'general',
+            reviewReason VARCHAR(255),
+            status ENUM('pending', 'used', 'ignored') DEFAULT 'pending',
+            knowledgeId INT NULL,
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            reviewedAt TIMESTAMP NULL,
+            reviewedBy INT NULL,
+            FOREIGN KEY (patientId) REFERENCES Users(id) ON DELETE SET NULL,
+            FOREIGN KEY (knowledgeId) REFERENCES AiKnowledge(id) ON DELETE SET NULL,
+            FOREIGN KEY (reviewedBy) REFERENCES Users(id) ON DELETE SET NULL,
+            INDEX idx_ai_training_samples_status (status, createdAt)
+        )
+    `);
+    await connection.query(`
+        CREATE TABLE IF NOT EXISTS AiFeedback (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            messageId INT NOT NULL,
+            userId INT NOT NULL,
+            rating ENUM('helpful', 'unhelpful') NOT NULL,
+            comment TEXT,
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_ai_feedback_message_user (messageId, userId),
+            FOREIGN KEY (messageId) REFERENCES ChatMessages(id) ON DELETE CASCADE,
+            FOREIGN KEY (userId) REFERENCES Users(id) ON DELETE CASCADE,
+            INDEX idx_ai_feedback_rating (rating, createdAt)
+        )
+    `);
+    await seedAiKnowledge(connection);
 
     await addColumnIfMissing(connection, 'Services', 'image', 'VARCHAR(255) DEFAULT NULL');
     await addColumnIfMissing(connection, 'Services', 'categoryId', 'INT DEFAULT NULL');
@@ -211,6 +279,7 @@ const runCompatibilityMigrations = async (connection) => {
     await addColumnIfMissing(connection, 'ChatMessages', 'metadata', 'TEXT');
     await addColumnIfMissing(connection, 'ChatConversations', 'needsStaff', 'TINYINT(1) DEFAULT 0');
     await addColumnIfMissing(connection, 'ChatConversations', 'priorityReason', 'VARCHAR(255) DEFAULT NULL');
+    await addColumnIfMissing(connection, 'ChatConversations', 'assistantState', 'TEXT');
     await addColumnIfMissing(connection, 'Promotions', 'name', "VARCHAR(150) NOT NULL DEFAULT 'Khuyến mãi'");
     await addColumnIfMissing(connection, 'Promotions', 'description', 'TEXT');
     await addColumnIfMissing(connection, 'Promotions', 'isActive', 'TINYINT(1) DEFAULT 1');

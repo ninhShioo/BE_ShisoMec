@@ -1,6 +1,8 @@
 const pool = require('../config/database');
+const { generateAiReply, getAiConfig } = require('./aiChat.service');
+const { createAppointmentRecord } = require('../controllers/appointment.controller');
 
-const ASSISTANT_NAME = 'Trợ lý Phenikaa Dental';
+const ASSISTANT_NAME = 'Trợ lý AI Phenikaa Dental';
 
 const normalizeText = (value) => String(value || '')
     .toLowerCase()
@@ -121,6 +123,114 @@ const topicCatalog = [
         duration: 30,
         answer: 'Với trẻ em, nên đặt lịch ở khung giờ bé tỉnh táo, ít mệt. Bác sĩ sẽ kiểm tra răng sữa, sâu răng, mọc răng và hướng dẫn chăm sóc tại nhà.',
         booking: 'Bạn có thể chọn Khám và tư vấn nha khoa, ghi chú tuổi của bé và triệu chứng hiện tại.'
+    },
+    {
+        id: 'broken_tooth',
+        label: 'Mẻ/vỡ răng',
+        keywords: ['me rang', 'vo rang', 'nut rang', 'gay men', 'sap rang', 'rang bi vo', 'rang bi me', 'can bi dau'],
+        serviceHints: ['tram', 'rang su', 'kham', 'tu van'],
+        duration: 45,
+        answer: 'Răng mẻ/vỡ cần bác sĩ kiểm tra độ sâu tổn thương, có lộ tủy hay nứt chân răng không. Không nên tự mài hoặc cắn đồ cứng ở vùng răng đó.',
+        booking: 'Bạn nên đặt Khám và tư vấn nha khoa. Nếu mẻ nhỏ có thể trám, nếu vỡ lớn bác sĩ sẽ tư vấn phục hình phù hợp.'
+    },
+    {
+        id: 'lost_filling',
+        label: 'Rơi miếng trám / bong phục hình',
+        keywords: ['roi tram', 'bung tram', 'mat mieng tram', 'roi mieng tram', 'bung rang su', 'long rang su', 'roi rang su', 'roi veneer'],
+        serviceHints: ['tram', 'rang su', 'kham', 'tu van'],
+        duration: 45,
+        answer: 'Miếng trám hoặc phục hình bị bong làm răng dễ ê buốt, kẹt thức ăn và sâu lại. Bạn nên khám sớm để bác sĩ kiểm tra và xử lý lại bề mặt răng.',
+        booking: 'Bạn có thể chọn Khám và tư vấn nha khoa hoặc Trám răng nếu dịch vụ có trong danh sách.'
+    },
+    {
+        id: 'bad_breath',
+        label: 'Hôi miệng',
+        keywords: ['hoi mieng', 'mui hoi', 'hoi tho co mui', 'mieng hoi', 'cao rang nhieu'],
+        serviceHints: ['cao voi', 'nha chu', 'kham', 'tu van'],
+        duration: 30,
+        answer: 'Hôi miệng thường liên quan tới cao răng, viêm lợi, sâu răng, kẹt thức ăn hoặc vệ sinh lưỡi chưa tốt. Bác sĩ cần kiểm tra khoang miệng để tìm nguyên nhân.',
+        booking: 'Bạn nên chọn Cạo vôi răng hoặc Khám và tư vấn nha khoa.'
+    },
+    {
+        id: 'after_extraction',
+        label: 'Sau nhổ răng',
+        keywords: ['sau nho rang', 'nho rang xong', 'chay mau sau nho', 'dau sau nho', 'o rang kho', 'hoi sau nho'],
+        serviceHints: ['kham', 'tu van', 'nho rang'],
+        duration: 30,
+        answer: 'Sau nhổ răng, đau nhẹ và rỉ máu ít có thể gặp trong thời gian đầu. Nếu chảy máu nhiều, đau tăng, sốt, hôi miệng nặng hoặc sưng lan, bạn cần được kiểm tra sớm.',
+        booking: 'Bạn nên đặt Khám và tư vấn nha khoa để bác sĩ kiểm tra vùng nhổ. Nếu chảy máu không cầm, hãy gọi hotline ngay.'
+    },
+    {
+        id: 'orthodontic_issue',
+        label: 'Sự cố niềng răng',
+        keywords: ['bung mac cai', 'dut day cung', 'day cung dam', 'khay nieng', 'mat khay', 'nieng bi dau', 'mac cai dau'],
+        serviceHints: ['nieng', 'chinh nha', 'kham', 'tu van'],
+        duration: 30,
+        answer: 'Khi bung mắc cài, dây cung đâm má hoặc mất khay niềng, bạn nên báo phòng khám để bác sĩ kiểm tra và điều chỉnh. Không nên tự cắt dây sâu trong miệng nếu không chắc chắn.',
+        booking: 'Bạn nên đặt lịch tư vấn/chỉnh nha hoặc nhắn gặp nhân viên để được xếp lịch xử lý nhanh.'
+    },
+    {
+        id: 'pregnancy',
+        label: 'Khám răng khi mang thai',
+        keywords: ['mang thai', 'ba bau', 'co bau', 'thai ky', 'bap benh khi mang thai', 'dau rang khi bau'],
+        serviceHints: ['kham', 'tu van', 'cao voi'],
+        duration: 30,
+        answer: 'Khi mang thai vẫn có thể khám răng, nhưng cần báo rõ tuần thai và tình trạng sức khỏe. Bác sĩ sẽ cân nhắc phương án an toàn, hạn chế can thiệp không cần thiết.',
+        booking: 'Bạn nên chọn Khám và tư vấn nha khoa, ghi chú đang mang thai và số tuần thai.'
+    },
+    {
+        id: 'mouth_ulcer',
+        label: 'Nhiệt miệng / loét miệng',
+        keywords: ['nhiet mieng', 'loet mieng', 'loet loi', 'dau niem mac', 'vet loet', 'mun trong mieng'],
+        serviceHints: ['kham', 'tu van'],
+        duration: 30,
+        answer: 'Vết loét miệng thường tự giảm, nhưng nếu kéo dài, đau nhiều, tái phát liên tục hoặc kèm sốt/sưng hạch thì nên khám để loại trừ nguyên nhân khác.',
+        booking: 'Bạn có thể chọn Khám và tư vấn nha khoa để bác sĩ kiểm tra niêm mạc miệng.'
+    }
+];
+
+const knowledgeBase = [
+    {
+        id: 'booking_flow',
+        title: 'Đặt lịch qua AI',
+        keywords: ['muon dat lich', 'dat lich giup', 'dang ky kham', 'hen lich', 'dat ho toi', 'toi muon kham'],
+        answer: 'Mình có thể đặt lịch hộ bạn ngay trong chat. Mình sẽ cần biết dịch vụ hoặc triệu chứng, ngày muốn khám, bác sĩ mong muốn và khung giờ phù hợp.'
+    },
+    {
+        id: 'first_visit',
+        title: 'Khám lần đầu',
+        keywords: ['lan dau di kham', 'can mang gi', 'di kham lan dau', 'chuan bi gi', 'toi moi kham lan dau'],
+        answer: 'Nếu khám lần đầu, bạn nên mang giấy tờ tùy thân, phim/chẩn đoán cũ nếu có, danh sách thuốc đang dùng và đến sớm vài phút để lễ tân check-in.'
+    },
+    {
+        id: 'late_arrival',
+        title: 'Đến muộn',
+        keywords: ['den muon', 'tre gio', 'toi bi tre', 'muon hon lich', 'qua gio hen'],
+        answer: 'Nếu có thể đến muộn, bạn nên báo lễ tân qua hotline. Phòng khám sẽ kiểm tra khả năng giữ lịch hoặc hỗ trợ đổi sang khung giờ phù hợp.'
+    },
+    {
+        id: 'price_policy',
+        title: 'Chi phí điều trị',
+        keywords: ['gia bao nhieu', 'chi phi', 'bao gia', 'co dat khong', 'tinh tien the nao'],
+        answer: 'Chi phí phụ thuộc tình trạng răng thực tế, dịch vụ cần làm và kế hoạch điều trị. Hệ thống có thể gợi ý giá dịch vụ, nhưng bác sĩ sẽ xác nhận sau khi thăm khám.'
+    },
+    {
+        id: 'doctor_choice',
+        title: 'Chọn bác sĩ',
+        keywords: ['chon bac si nao', 'bac si nao tot', 'ai kham tot', 'bac si nao phu hop', 'bac si nao ranh'],
+        answer: 'Bạn có thể chọn bác sĩ theo lịch trống. Nếu không chắc nên chọn ai, mình có thể gợi ý các slot gần nhất hoặc để lễ tân phân công bác sĩ phù hợp.'
+    },
+    {
+        id: 'payment_help',
+        title: 'Thanh toán',
+        keywords: ['thanh toan', 'vnpay', 'qr', 'hoa don', 'chuyen khoan', 'tien mat', 'the ngan hang'],
+        answer: 'Phòng khám hỗ trợ tiền mặt, thẻ/chuyển khoản và VNPay QR nếu hóa đơn có bật thanh toán. Sau khi thanh toán thành công, trạng thái hóa đơn sẽ được cập nhật trong hệ thống.'
+    },
+    {
+        id: 'human_support',
+        title: 'Gặp nhân viên',
+        keywords: ['gap nhan vien', 'gap le tan', 'can nguoi tu van', 'noi chuyen voi nguoi that', 'nhan vien ho tro'],
+        answer: 'Mình sẽ chuyển hội thoại sang nhóm cần nhân viên hỗ trợ để lễ tân/admin nhìn thấy và phản hồi cho bạn.'
     }
 ];
 
@@ -142,6 +252,41 @@ const hasKeyword = (text, keyword) => {
 };
 
 const hasAny = (text, keywords) => keywords.some((keyword) => hasKeyword(text, keyword));
+
+const uniqueTokens = (text) => [...new Set(normalizeText(text).split(' ').filter((token) => token.length >= 3))];
+
+const scoreKeywords = (text, keywords) => {
+    const normalizedText = normalizeText(text);
+    const textTokens = uniqueTokens(normalizedText);
+    let score = 0;
+
+    keywords.forEach((keyword) => {
+        const normalizedKeyword = normalizeText(keyword);
+        if (!normalizedKeyword) return;
+
+        if (normalizedText.includes(normalizedKeyword)) {
+            score += normalizedKeyword.split(' ').length >= 2 ? 6 : 3;
+            return;
+        }
+
+        const keywordTokens = uniqueTokens(normalizedKeyword);
+        const matchedTokens = keywordTokens.filter((token) => textTokens.includes(token));
+        if (keywordTokens.length > 0 && matchedTokens.length > 0) {
+            score += matchedTokens.length / keywordTokens.length >= 0.75 ? 3 : matchedTokens.length;
+        }
+    });
+
+    return score;
+};
+
+const findBestByKeywords = (items, text, threshold = 2) => {
+    const ranked = items
+        .map((item) => ({ item, score: scoreKeywords(text, item.keywords || []) }))
+        .filter((entry) => entry.score >= threshold)
+        .sort((a, b) => b.score - a.score);
+
+    return ranked[0]?.item || null;
+};
 
 const getSettings = async () => {
     const defaults = {
@@ -271,7 +416,46 @@ const findAvailableSlots = async ({ days = 10, limit = 5, duration = 30 } = {}) 
     return results.sort((a, b) => `${a.date}T${a.time}`.localeCompare(`${b.date}T${b.time}`)).slice(0, limit);
 };
 
-const findTopic = (text) => topicCatalog.find((topic) => hasAny(text, topic.keywords)) || null;
+const findTopic = (text) => (
+    topicCatalog.find((topic) => hasAny(text, topic.keywords))
+    || findBestByKeywords(topicCatalog, text, 2)
+);
+
+const findKnowledge = (text) => (
+    knowledgeBase.find((item) => hasAny(text, item.keywords))
+    || findBestByKeywords(knowledgeBase, text, 2)
+);
+
+const getDbKnowledgeItems = async () => {
+    try {
+        const [rows] = await pool.query(
+            `SELECT id, title, category, keywords, answer
+             FROM AiKnowledge
+             WHERE isActive = 1
+             ORDER BY updatedAt DESC
+             LIMIT 100`
+        );
+
+        return rows.map((row) => ({
+            id: `db_${row.id}`,
+            title: row.title,
+            category: row.category,
+            keywords: String(row.keywords || row.title || '').split(',').map((item) => item.trim()).filter(Boolean),
+            answer: row.answer
+        }));
+    } catch {
+        return [];
+    }
+};
+
+const findKnowledgeMatch = async (text) => {
+    const dbItems = await getDbKnowledgeItems();
+    return (
+        dbItems.find((item) => hasAny(text, item.keywords))
+        || findBestByKeywords(dbItems, text, 2)
+        || findKnowledge(text)
+    );
+};
 
 const getRelevantServices = async (topic, text) => {
     const [services] = await pool.query(
@@ -397,8 +581,782 @@ const commonActions = (settings = {}) => [
     ...(settings.mapUrl ? [action('Mở bản đồ', 'url', settings.mapUrl)] : [])
 ];
 
-const getPatientAppointments = async (patientId) => {
+const parseJsonSafe = (value, fallback = null) => {
+    if (!value) return fallback;
+    if (typeof value === 'object') return value;
+    try {
+        return JSON.parse(value);
+    } catch {
+        return fallback;
+    }
+};
+
+const getConversationAssistantState = async (patientId) => {
+    const [[conversation]] = await pool.query(
+        'SELECT assistantState FROM ChatConversations WHERE patientId = ? LIMIT 1',
+        [patientId]
+    );
+
+    return parseJsonSafe(conversation?.assistantState, null);
+};
+
+const saveConversationAssistantState = async (patientId, state) => {
+    await pool.query(
+        `UPDATE ChatConversations
+         SET assistantState = ?, updatedAt = CURRENT_TIMESTAMP
+         WHERE patientId = ?`,
+        [state ? JSON.stringify(state) : null, patientId]
+    );
+};
+
+const clearConversationAssistantState = (patientId) => saveConversationAssistantState(patientId, null);
+
+const getActiveServices = async () => {
+    const [services] = await pool.query(
+        `SELECT id, name, price, duration, description
+         FROM Services
+         WHERE status = "active"
+         ORDER BY name ASC
+         LIMIT 100`
+    );
+
+    return services;
+};
+
+const getActiveDentists = async () => {
+    const [dentists] = await pool.query(
+        `SELECT id, fullName
+         FROM Users
+         WHERE role = "dentist" AND status = "active"
+         ORDER BY fullName ASC`
+    );
+
+    return dentists;
+};
+
+const parseRequestedDate = (text) => {
+    const normalized = normalizeText(text);
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    if (hasAny(normalized, ['ngay mai', 'mai'])) {
+        const next = new Date(today);
+        next.setDate(today.getDate() + 1);
+        return formatDateKey(next);
+    }
+
+    if (hasAny(normalized, ['hom nay', 'today'])) {
+        return formatDateKey(today);
+    }
+
+    const isoMatch = String(text).match(/\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b/);
+    if (isoMatch) {
+        const value = new Date(Number(isoMatch[1]), Number(isoMatch[2]) - 1, Number(isoMatch[3]));
+        if (!Number.isNaN(value.getTime())) return formatDateKey(value);
+    }
+
+    const dateMatch = String(text).match(/\b(\d{1,2})[/-](\d{1,2})(?:[/-](20\d{2}))?\b/);
+    if (dateMatch) {
+        const day = Number(dateMatch[1]);
+        const month = Number(dateMatch[2]);
+        const year = Number(dateMatch[3] || now.getFullYear());
+        const value = new Date(year, month - 1, day);
+        if (!Number.isNaN(value.getTime())) {
+            if (!dateMatch[3] && value < today) value.setFullYear(value.getFullYear() + 1);
+            return formatDateKey(value);
+        }
+    }
+
+    return '';
+};
+
+const parseRequestedTime = (text) => {
+    const raw = String(text || '').toLowerCase();
+    const explicitMatch = raw.match(/\b([01]?\d|2[0-3])\s*(?::|h|giờ|gio)\s*([0-5]\d)?\b/);
+    const bareHourMatch = raw.trim().match(/^([01]?\d|2[0-3])$/);
+    const match = explicitMatch || bareHourMatch;
+    if (!match) return '';
+
+    const hour = Number(match[1]);
+    const minute = match[2] ? Number(match[2]) : 0;
+    if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return '';
+
+    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+};
+
+const matchServicesFromText = (services, text) => {
+    const normalized = normalizeText(text);
+    const matched = services.filter((service) => {
+        const serviceName = normalizeText(service.name);
+        if (!serviceName) return false;
+        if (normalized.includes(serviceName)) return true;
+
+        const serviceWords = serviceName.split(' ').filter((word) => word.length >= 3);
+        return serviceWords.length >= 2 && serviceWords.every((word) => normalized.includes(word));
+    });
+
+    if (matched.length > 0) return matched.slice(0, 4);
+
+    const topic = findTopic(normalized);
+    if (!topic) return [];
+
+    return services.filter((service) => {
+        const serviceText = normalizeText(`${service.name} ${service.description || ''}`);
+        return topic.serviceHints.some((hint) => serviceText.includes(hint));
+    }).slice(0, 2);
+};
+
+const isVagueClinicalTopic = (topic, text) => {
+    if (!topic) return false;
+    const normalized = normalizeText(text);
+    if (['emergency', 'wisdom_tooth', 'root_canal', 'gum', 'braces', 'implant', 'whitening', 'cosmetic', 'children'].includes(topic.id)) {
+        return false;
+    }
+
+    if (topic.id === 'toothache') {
+        return !hasAny(normalized, [
+            'sau rang',
+            'lo sau',
+            'e buot',
+            'dau ve dem',
+            'dau len dau',
+            'sung',
+            'rang khon',
+            'chay mau',
+            'me rang',
+            'vo rang',
+            'roi tram'
+        ]);
+    }
+
+    return false;
+};
+
+const inferTopicFromTriage = (text) => {
+    const normalized = normalizeText(text);
+    if (hasAny(normalized, ['sung mat', 'sot', 'kho tho', 'kho nuot', 'chay mau khong cam', 'dau du doi'])) return 'emergency';
+    if (hasAny(normalized, ['rang khon', 'cuoi ham', 'ham trong cung', 'moc rang'])) return 'wisdom_tooth';
+    if (hasAny(normalized, ['dau ve dem', 'dau nhuc lien tuc', 'dau len dau', 'dau giat', 'buot lau'])) return 'root_canal';
+    if (hasAny(normalized, ['chay mau chan rang', 'sung loi', 'hoi mieng', 'loi dau'])) return 'gum';
+    if (hasAny(normalized, ['me rang', 'vo rang', 'nut rang', 'gay rang'])) return 'broken_tooth';
+    if (hasAny(normalized, ['e buot', 'an nong', 'an lanh', 'lo sau', 'sau rang'])) return 'toothache';
+    return '';
+};
+
+const getTopicById = (topicId) => topicCatalog.find((topic) => topic.id === topicId) || null;
+
+const buildTriageQuestion = (topic) => (
+    [
+        `${topic?.answer || 'Mình cần hỏi thêm để định hướng đúng hơn trước khi đặt lịch.'}`,
+        'Bạn mô tả thêm giúp mình 3 ý ngắn nhé:',
+        '1. Đau ở răng/vị trí nào? Có phải răng khôn/cuối hàm không?',
+        '2. Đau âm ỉ, ê buốt khi ăn nóng/lạnh, hay đau nhiều về đêm?',
+        '3. Có sưng lợi/sưng mặt/sốt/chảy máu không?'
+    ].join('\n')
+);
+
+const getPrimaryServicesForTopic = (services, topic) => {
+    if (!topic) return [];
+    return services.filter((service) => {
+        const serviceText = normalizeText(`${service.name} ${service.description || ''}`);
+        return topic.serviceHints.some((hint) => serviceText.includes(hint));
+    }).slice(0, 2);
+};
+
+const matchDentistFromText = (dentists, text) => {
+    const normalized = normalizeText(text);
+    if (hasAny(normalized, ['bac si nao cung duoc', 'ai cung duoc', 'tu dong chon', 'chon giup', 'bat ky'])) {
+        return { any: true, dentist: null };
+    }
+
+    const dentist = dentists.find((item) => {
+        const fullName = normalizeText(item.fullName);
+        if (normalized.includes(fullName)) return true;
+
+        const words = fullName.split(' ').filter((word) => word.length >= 3);
+        return words.length > 0 && words.every((word) => normalized.includes(word));
+    });
+
+    return { any: false, dentist: dentist || null };
+};
+
+const getDurationForServices = async (serviceIds) => {
+    if (!Array.isArray(serviceIds) || serviceIds.length === 0) return 30;
+    const [rows] = await pool.query(
+        'SELECT COALESCE(SUM(COALESCE(duration, 30)), 0) as totalDuration FROM Services WHERE id IN (?) AND status = "active"',
+        [serviceIds]
+    );
+    return Math.max(Number(rows[0]?.totalDuration || 0), 30);
+};
+
+const findSlotsForDentistDate = async ({ dentistId, date, serviceIds, limit = 8 }) => {
+    const duration = await getDurationForServices(serviceIds);
+    const settings = await getSettings();
+    const earliestBookable = getEarliestBookableDateTime(settings.bookingLeadHours);
+    const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
+    const [[schedule]] = await pool.query(
+        `SELECT startTime, endTime, breakStart, breakEnd, slotIntervalMinutes, isActive
+         FROM DoctorSchedules
+         WHERE dentistId = ? AND dayOfWeek = ?
+         LIMIT 1`,
+        [dentistId, dayOfWeek]
+    );
+
+    if (!schedule || Number(schedule.isActive) !== 1) return [];
+
+    const [daysOff] = await pool.query(
+        'SELECT id FROM DoctorDaysOff WHERE dentistId = ? AND offDate = ? LIMIT 1',
+        [dentistId, date]
+    );
+    if (daysOff.length > 0) return [];
+
+    const busyRanges = await getBusyRanges(dentistId, date);
+    const workStart = timeToMinutes(schedule.startTime);
+    const workEnd = timeToMinutes(schedule.endTime);
+    const breakStart = schedule.breakStart ? timeToMinutes(schedule.breakStart) : null;
+    const breakEnd = schedule.breakEnd ? timeToMinutes(schedule.breakEnd) : null;
+    const interval = Number(schedule.slotIntervalMinutes || 30);
+    const slots = [];
+
+    for (let minutes = workStart; minutes + duration <= workEnd && slots.length < limit; minutes += interval) {
+        const slotEnd = minutes + duration;
+        const time = minutesToTime(minutes);
+        const dateTime = new Date(`${date}T${time}:00`);
+        const inBreak = breakStart !== null && breakEnd !== null && rangesOverlap(minutes, slotEnd, breakStart, breakEnd);
+        const isBooked = busyRanges.some((range) => rangesOverlap(minutes, slotEnd, range.start, range.end));
+
+        if (dateTime >= earliestBookable && !inBreak && !isBooked) {
+            slots.push({ time, date, dentistId });
+        }
+    }
+
+    return slots;
+};
+
+const findDentistForExactSlot = async ({ dentists, date, time, serviceIds }) => {
+    for (const dentist of dentists) {
+        const slots = await findSlotsForDentistDate({ dentistId: dentist.id, date, serviceIds, limit: 40 });
+        if (slots.some((slot) => slot.time === time)) return dentist;
+    }
+
+    return null;
+};
+
+const formatServicesForQuestion = (services) => (
+    services.slice(0, 5).map((service, index) => (
+        `${index + 1}. ${service.name}${service.duration ? ` (${service.duration} phút)` : ''}`
+    )).join('\n')
+);
+
+const formatDentistsForQuestion = (dentists) => (
+    dentists.slice(0, 5).map((dentist, index) => `${index + 1}. ${dentist.fullName}`).join('\n')
+);
+
+const getChoiceNumber = (message) => {
+    const match = String(message || '').trim().match(/^(?:so|số|chon|chọn)?\s*(\d{1,2})$/i);
+    if (!match) return null;
+    const value = Number(match[1]);
+    return Number.isInteger(value) && value > 0 ? value : null;
+};
+
+const pickNumberedChoice = (items, choiceNumber) => {
+    if (!choiceNumber || !Array.isArray(items)) return null;
+    return items[choiceNumber - 1] || null;
+};
+
+const isBookingStartIntent = (text) => hasAny(text, [
+    'dat lich',
+    'dang ky lich',
+    'hen lich',
+    'muon kham',
+    'muon dat',
+    'dat ho',
+    'dang ky kham',
+    'hen bac si',
+    'can kham',
+    'muon gap bac si',
+    'xep lich',
+    'kham rang'
+]) || scoreKeywords(text, knowledgeBase.find((item) => item.id === 'booking_flow')?.keywords || []) >= 2;
+
+const isGenericConsultIntent = (text) => {
+    const normalized = normalizeText(text);
+    return hasAny(normalized, ['tu van', 'can tu van', 'toi muon tu van', 'hoi tu van'])
+        && !findTopic(normalized)
+        && !hasAny(normalized, ['dat lich', 'dang ky', 'hen lich', 'gia', 'chi phi', 'nieng', 'implant', 'rang su', 'tay trang']);
+};
+
+const isNewConsultationIntent = (text) => hasAny(text, [
+    'tu van cai khac',
+    'hoi cai khac',
+    'doi van de',
+    'tu van lai',
+    'bat dau lai',
+    'van de khac'
+]);
+
+const isHumanSupportIntent = (text) => hasAny(text, [
+    'gap nhan vien',
+    'gap le tan',
+    'can nguoi tu van',
+    'nhan vien ho tro',
+    'tu van vien',
+    'goi lai',
+    'noi chuyen voi nguoi that',
+    'nguoi that ho tro'
+]);
+
+const isCancelBookingDraft = (text) => hasAny(text, [
+    'huy dat lich',
+    'bo qua dat lich',
+    'khong dat nua',
+    'dung dat lich'
+]);
+
+const isBookingConfirmIntent = (text) => hasAny(text, [
+    'xac nhan',
+    'dong y',
+    'ok',
+    'oke',
+    'dung roi',
+    'chot lich',
+    'dat lich nay',
+    'tao lich',
+    'dat di'
+]);
+
+const detectBookingEditIntent = (text) => {
+    if (hasAny(text, ['doi dich vu', 'chon dich vu khac', 'sua dich vu', 'doi trieu chung'])) return 'service';
+    if (hasAny(text, ['doi ngay', 'sua ngay', 'ngay khac', 'chon ngay khac'])) return 'date';
+    if (hasAny(text, ['doi bac si', 'sua bac si', 'chon bac si khac'])) return 'dentist';
+    if (hasAny(text, ['doi gio', 'sua gio', 'gio khac', 'chon gio khac', 'doi khung gio'])) return 'time';
+    return '';
+};
+
+const applyBookingEditIntent = (draft, editIntent) => {
+    const nextDraft = { ...draft };
+    if (editIntent === 'service') {
+        nextDraft.serviceIds = [];
+        nextDraft.triageTopicId = '';
+        nextDraft.triageDone = false;
+        nextDraft.notes = '';
+    }
+    if (editIntent === 'date') {
+        nextDraft.appointmentDate = '';
+        nextDraft.appointmentTime = '';
+        nextDraft.appointmentTimeSource = '';
+    }
+    if (editIntent === 'dentist') {
+        nextDraft.dentistId = null;
+        nextDraft.appointmentTime = '';
+        nextDraft.appointmentTimeSource = '';
+    }
+    if (editIntent === 'time') {
+        nextDraft.appointmentTime = '';
+        nextDraft.appointmentTimeSource = '';
+    }
+    return nextDraft;
+};
+
+const bookingConfirmActions = () => [
+    action('Xác nhận đặt lịch', 'message', 'Xác nhận đặt lịch'),
+    action('Đổi ngày', 'message', 'Đổi ngày'),
+    action('Đổi giờ', 'message', 'Đổi giờ'),
+    action('Đổi bác sĩ', 'message', 'Đổi bác sĩ'),
+    action('Hủy nháp', 'message', 'Hủy đặt lịch')
+];
+
+const buildDraftSummary = (draft, services, dentists) => {
+    const serviceNames = services.filter((service) => draft.serviceIds?.includes(service.id)).map((service) => service.name).join(', ');
+    const dentistName = dentists.find((dentist) => dentist.id === draft.dentistId)?.fullName || '';
+
+    return [
+        serviceNames ? `Dịch vụ: ${serviceNames}` : '',
+        draft.triageTopicId ? `Định hướng: ${getTopicById(draft.triageTopicId)?.label || draft.triageTopicId}` : '',
+        draft.appointmentDate ? `Ngày: ${formatDate(draft.appointmentDate)}` : '',
+        draft.appointmentTime ? `Giờ: ${draft.appointmentTime}` : '',
+        dentistName ? `Bác sĩ: ${dentistName}` : ''
+    ].filter(Boolean).join('\n');
+};
+
+const buildBookingResponse = async (message, { patientId, user }) => {
+    if (!Number.isInteger(Number(patientId)) || Number(patientId) <= 0) return null;
+
+    const text = normalizeText(message);
+    const existingState = await getConversationAssistantState(patientId);
+    const isInBookingFlow = existingState?.mode === 'booking';
+
+    if (!isInBookingFlow && !isBookingStartIntent(text)) return null;
+
+    if (isHumanSupportIntent(text)) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: [
+                'Mình đã ghi nhận bạn muốn gặp nhân viên hỗ trợ.',
+                'Lễ tân/admin sẽ thấy hội thoại này trong nhóm cần xử lý và phản hồi cho bạn sớm.',
+                'Hotline hỗ trợ nhanh: 0869 800 318.'
+            ].join('\n'),
+            metadata: {
+                intent: 'human_support',
+                needsStaff: true,
+                priorityReason: 'Khách yêu cầu nhân viên hỗ trợ.',
+                aiMode: 'local_booking',
+                quickActions: [action('Đặt lịch thủ công', 'route', '/book-appointment')]
+            },
+            needsStaff: true,
+            priorityReason: 'Khách yêu cầu nhân viên hỗ trợ.'
+        };
+    }
+
+    if (isGenericConsultIntent(text) || isNewConsultationIntent(text)) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: [
+                'Bạn muốn tư vấn về vấn đề nào ạ?',
+                'Bạn có thể mô tả triệu chứng hoặc dịch vụ quan tâm, ví dụ: đau răng, răng khôn, niềng răng, Implant, răng sứ, tẩy trắng, chi phí hoặc lịch trống.',
+                'Nếu muốn gặp người thật, nhắn “gặp nhân viên” để mình chuyển lễ tân hỗ trợ.'
+            ].join('\n'),
+            metadata: {
+                intent: 'consultation_clarify',
+                aiMode: 'local_booking',
+                quickActions: [
+                    action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ'),
+                    action('Đặt lịch thủ công', 'route', '/book-appointment')
+                ]
+            },
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (isCancelBookingDraft(text)) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: 'Mình đã hủy nháp đặt lịch trong chat. Khi cần đặt lại, bạn chỉ cần nhắn “muốn đặt lịch”.',
+            metadata: {
+                intent: 'booking_cancelled',
+                aiMode: 'local_booking',
+                quickActions: [action('Đặt lịch thủ công', 'route', '/book-appointment')]
+            },
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    const services = await getActiveServices();
+    const dentists = await getActiveDentists();
+    const draft = {
+        serviceIds: [],
+        appointmentDate: '',
+        appointmentTime: '',
+        appointmentTimeSource: '',
+        dentistId: null,
+        triageTopicId: '',
+        triageDone: false,
+        notes: '',
+        ...(existingState?.draft || {})
+    };
+    const editIntent = detectBookingEditIntent(text);
+    if (editIntent) {
+        const editedDraft = applyBookingEditIntent(draft, editIntent);
+        await saveConversationAssistantState(patientId, {
+            mode: 'booking',
+            draft: editedDraft,
+            lastPrompt: editIntent,
+            lastChoices: {},
+            pendingConfirmation: false,
+            updatedAt: new Date().toISOString()
+        });
+
+        const editLabels = {
+            service: 'dịch vụ/triệu chứng',
+            date: 'ngày khám',
+            dentist: 'bác sĩ',
+            time: 'giờ khám'
+        };
+
+        return {
+            message: `Mình đã mở lại bước ${editLabels[editIntent]}. Bạn nhập thông tin mới giúp mình nhé.`,
+            metadata: { intent: `booking_edit_${editIntent}`, aiMode: 'local_booking', quickActions: [action('Hủy nháp', 'message', 'Hủy đặt lịch')] },
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+    const lastChoices = existingState?.lastChoices || {};
+    const choiceNumber = getChoiceNumber(message);
+
+    if (choiceNumber && existingState?.lastPrompt === 'service' && !draft.serviceIds?.length) {
+        const pickedService = pickNumberedChoice(lastChoices.services || [], choiceNumber);
+        if (pickedService?.id) {
+            draft.serviceIds = [Number(pickedService.id)];
+        }
+    }
+
+    if (choiceNumber && existingState?.lastPrompt === 'dentist' && !draft.dentistId) {
+        const pickedDentist = pickNumberedChoice(lastChoices.dentists || [], choiceNumber);
+        if (pickedDentist?.id) {
+            draft.dentistId = Number(pickedDentist.id);
+            const accidentalChoiceTime = `${String(choiceNumber).padStart(2, '0')}:00`;
+            if (draft.appointmentTimeSource === 'choice_number' || draft.appointmentTime === accidentalChoiceTime) {
+                draft.appointmentTime = '';
+                draft.appointmentTimeSource = '';
+            }
+        }
+    }
+
+    if (choiceNumber && existingState?.lastPrompt === 'time' && !draft.appointmentTime) {
+        const pickedSlot = pickNumberedChoice(lastChoices.slots || [], choiceNumber);
+        if (pickedSlot?.time) {
+            draft.appointmentTime = pickedSlot.time;
+            draft.appointmentTimeSource = 'slot_choice';
+        }
+    }
+
+    const topicFromMessage = findTopic(message);
+    if (!choiceNumber && topicFromMessage && isVagueClinicalTopic(topicFromMessage, message) && !draft.triageDone) {
+        draft.triageTopicId = topicFromMessage.id;
+        await saveConversationAssistantState(patientId, {
+            mode: 'booking',
+            draft,
+            lastPrompt: 'triage',
+            lastChoices: {},
+            updatedAt: new Date().toISOString()
+        });
+        return {
+            message: buildTriageQuestion(topicFromMessage),
+            metadata: { intent: 'booking_triage', aiMode: 'local_booking', quickActions: [action('Hủy nháp', 'message', 'Hủy đặt lịch'), action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ')] },
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (existingState?.lastPrompt === 'triage') {
+        const inferredTopicId = inferTopicFromTriage(message) || draft.triageTopicId;
+        const inferredTopic = getTopicById(inferredTopicId);
+        if (inferredTopic) {
+            draft.triageTopicId = inferredTopic.id;
+            draft.triageDone = true;
+            const inferredServices = getPrimaryServicesForTopic(services, inferredTopic);
+            if (inferredServices.length > 0) {
+                draft.serviceIds = inferredServices.map((service) => service.id).slice(0, 2);
+            }
+            draft.notes = `Triệu chứng khách mô tả qua AI: ${String(message).slice(0, 400)}`;
+        }
+    }
+
+    const matchedServices = matchServicesFromText(services, message);
+    if (!choiceNumber && matchedServices.length > 0 && !draft.serviceIds?.length) {
+        draft.serviceIds = [...new Set([...(draft.serviceIds || []), ...matchedServices.map((service) => service.id)])].slice(0, 4);
+    }
+
+    const requestedDate = parseRequestedDate(message);
+    if (requestedDate) draft.appointmentDate = requestedDate;
+
+    const requestedTime = choiceNumber && ['service', 'dentist', 'time'].includes(existingState?.lastPrompt) ? '' : parseRequestedTime(message);
+    if (requestedTime) {
+        draft.appointmentTime = requestedTime;
+        draft.appointmentTimeSource = 'explicit';
+    }
+
+    const dentistMatch = matchDentistFromText(dentists, message);
+    if (dentistMatch.dentist) draft.dentistId = dentistMatch.dentist.id;
+    if (dentistMatch.any && draft.appointmentDate && draft.appointmentTime && draft.serviceIds.length > 0) {
+        const autoDentist = await findDentistForExactSlot({
+            dentists,
+            date: draft.appointmentDate,
+            time: draft.appointmentTime,
+            serviceIds: draft.serviceIds
+        });
+        if (autoDentist) draft.dentistId = autoDentist.id;
+    }
+
+    const state = { mode: 'booking', draft, updatedAt: new Date().toISOString() };
+    const baseActions = [
+        action('Đặt lịch thủ công', 'route', '/book-appointment'),
+        action('Hủy nháp', 'message', 'Hủy đặt lịch')
+    ];
+
+    if (!draft.serviceIds?.length) {
+        const suggested = matchedServices.length ? matchedServices : services.slice(0, 5);
+        await saveConversationAssistantState(patientId, {
+            ...state,
+            lastPrompt: 'service',
+            lastChoices: {
+                services: suggested.slice(0, 5).map((service) => ({ id: service.id, name: service.name }))
+            }
+        });
+        return {
+            message: [
+                'Bạn muốn đặt lịch dịch vụ nào?',
+                suggested.length ? `Một số dịch vụ đang có:\n${formatServicesForQuestion(suggested)}\nBạn có thể nhập số thứ tự hoặc tên dịch vụ.` : 'Bạn có thể nhắn tên dịch vụ hoặc triệu chứng, ví dụ: đau răng, răng khôn, niềng răng.'
+            ].join('\n'),
+            metadata: { intent: 'booking_collect_service', aiMode: 'local_booking', quickActions: baseActions },
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (!draft.appointmentDate) {
+        await saveConversationAssistantState(patientId, {
+            ...state,
+            lastPrompt: 'date',
+            lastChoices: {}
+        });
+        return {
+            message: [
+                'Bạn muốn khám ngày nào?',
+                'Bạn có thể nhắn theo dạng 10/07/2026, ngày mai, hoặc 2026-07-10.',
+                buildDraftSummary(draft, services, dentists)
+            ].filter(Boolean).join('\n'),
+            metadata: { intent: 'booking_collect_date', aiMode: 'local_booking', quickActions: baseActions },
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (!draft.dentistId) {
+        await saveConversationAssistantState(patientId, {
+            ...state,
+            lastPrompt: 'dentist',
+            lastChoices: {
+                dentists: dentists.slice(0, 5).map((dentist) => ({ id: dentist.id, fullName: dentist.fullName }))
+            }
+        });
+        return {
+            message: [
+                'Bạn muốn đặt với bác sĩ nào?',
+                dentists.length ? formatDentistsForQuestion(dentists) : 'Hiện chưa có bác sĩ đang hoạt động để chọn.',
+                'Bạn có thể nhập số thứ tự, tên bác sĩ, hoặc nhắn “bác sĩ nào cũng được” để mình tự chọn slot phù hợp.'
+            ].join('\n'),
+            metadata: { intent: 'booking_collect_dentist', aiMode: 'local_booking', quickActions: baseActions },
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (!draft.appointmentTime) {
+        const slots = await findSlotsForDentistDate({
+            dentistId: draft.dentistId,
+            date: draft.appointmentDate,
+            serviceIds: draft.serviceIds,
+            limit: 6
+        });
+        await saveConversationAssistantState(patientId, {
+            ...state,
+            lastPrompt: 'time',
+            lastChoices: {
+                slots: slots.slice(0, 6).map((slot) => ({ time: slot.time, date: slot.date, dentistId: slot.dentistId }))
+            }
+        });
+        return {
+            message: [
+                'Bạn muốn khám giờ nào?',
+                slots.length
+                    ? `Các giờ còn trống ngày ${formatDate(draft.appointmentDate)}:\n${slots.map((slot, index) => `${index + 1}. ${slot.time}`).join('\n')}\nBạn có thể nhập số thứ tự hoặc giờ cụ thể.`
+                    : 'Ngày này hiện chưa thấy khung giờ trống với bác sĩ đã chọn. Bạn có thể đổi ngày hoặc đổi bác sĩ.'
+            ].join('\n'),
+            metadata: { intent: 'booking_collect_time', aiMode: 'local_booking', quickActions: baseActions },
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (!existingState?.pendingConfirmation || !isBookingConfirmIntent(text)) {
+        await saveConversationAssistantState(patientId, {
+            ...state,
+            lastPrompt: 'confirm',
+            lastChoices: {},
+            pendingConfirmation: true
+        });
+
+        return {
+            message: [
+                'Mình đã có đủ thông tin. Bạn kiểm tra lại giúp mình:',
+                buildDraftSummary(draft, services, dentists),
+                '',
+                'Nếu đúng, nhắn “xác nhận” để mình tạo lịch hẹn.',
+                'Nếu muốn sửa, bạn nhắn: đổi dịch vụ, đổi ngày, đổi bác sĩ hoặc đổi giờ.'
+            ].join('\n'),
+            metadata: {
+                intent: 'booking_confirm',
+                aiMode: 'local_booking',
+                quickActions: bookingConfirmActions()
+            },
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const { appointmentId } = await createAppointmentRecord(connection, {
+            actor: user,
+            patientId,
+            dentistId: draft.dentistId,
+            appointmentDate: draft.appointmentDate,
+            appointmentTime: draft.appointmentTime,
+            notes: `Đặt qua AI chatbox.${draft.notes ? ` ${draft.notes}` : message ? ` Ghi chú khách: ${String(message).slice(0, 300)}` : ''}`,
+            serviceIds: draft.serviceIds,
+            sourceNote: 'AI chatbox tạo lịch hẹn'
+        });
+        await connection.commit();
+        await clearConversationAssistantState(patientId);
+
+        return {
+            message: [
+                `Đặt lịch thành công. Mã lịch hẹn: #${appointmentId}.`,
+                buildDraftSummary(draft, services, dentists),
+                'Lịch đang ở trạng thái chờ xác nhận. Lễ tân sẽ kiểm tra và xác nhận trước khi bạn đến.',
+                'Hotline hỗ trợ: 0869 800 318.'
+            ].join('\n'),
+            metadata: {
+                intent: 'booking_created',
+                appointmentId,
+                aiMode: 'local_booking',
+                quickActions: [
+                    action('Xem lịch hẹn', 'route', '/profile?tab=appointments'),
+                    action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ')
+                ]
+            },
+            needsStaff: false,
+            priorityReason: ''
+        };
+    } catch (error) {
+        await connection.rollback();
+        await saveConversationAssistantState(patientId, state);
+        const slots = draft.dentistId && draft.appointmentDate
+            ? await findSlotsForDentistDate({ dentistId: draft.dentistId, date: draft.appointmentDate, serviceIds: draft.serviceIds, limit: 5 })
+            : [];
+
+        return {
+            message: [
+                `Mình chưa đặt được lịch vì: ${error.message}`,
+                slots.length ? `Bạn có thể chọn một giờ trống khác:\n${slots.map((slot, index) => `${index + 1}. ${slot.time}`).join('\n')}` : 'Bạn có thể đổi ngày, giờ hoặc bác sĩ để mình thử lại.'
+            ].join('\n'),
+            metadata: { intent: 'booking_failed', aiMode: 'local_booking', quickActions: baseActions },
+            needsStaff: false,
+            priorityReason: ''
+        };
+    } finally {
+        connection.release();
+    }
+};
+
+const getPatientAppointments = async (patientId, scope = 'upcoming') => {
     if (!Number.isInteger(Number(patientId)) || Number(patientId) <= 0) return [];
+
+    const whereByScope = {
+        upcoming: 'AND a.status IN ("pending", "confirmed", "arrived", "in_progress") AND TIMESTAMP(a.appointmentDate, a.appointmentTime) >= NOW()',
+        all: 'AND a.status <> "cancelled"',
+        completed: 'AND a.status = "completed"',
+        cancelled: 'AND a.status = "cancelled"',
+        past: 'AND TIMESTAMP(a.appointmentDate, a.appointmentTime) < NOW()'
+    }[scope] || 'AND a.status IN ("pending", "confirmed", "arrived", "in_progress") AND TIMESTAMP(a.appointmentDate, a.appointmentTime) >= NOW()';
+
+    const orderByScope = scope === 'upcoming'
+        ? 'ORDER BY a.appointmentDate ASC, a.appointmentTime ASC'
+        : 'ORDER BY a.appointmentDate DESC, a.appointmentTime DESC';
 
     const [rows] = await pool.query(
         `SELECT
@@ -413,10 +1371,9 @@ const getPatientAppointments = async (patientId) => {
          LEFT JOIN Appointment_Services aps ON aps.appointmentId = a.id
          LEFT JOIN Services s ON s.id = aps.serviceId
          WHERE a.patientId = ?
-           AND a.status IN ("pending", "confirmed", "arrived", "in_progress")
-           AND TIMESTAMP(a.appointmentDate, a.appointmentTime) >= NOW()
+           ${whereByScope}
          GROUP BY a.id, a.appointmentDate, a.appointmentTime, a.status, dentist.fullName
-         ORDER BY a.appointmentDate ASC, a.appointmentTime ASC
+         ${orderByScope}
          LIMIT 5`,
         [patientId]
     );
@@ -424,8 +1381,14 @@ const getPatientAppointments = async (patientId) => {
     return rows;
 };
 
-const getPatientInvoices = async (patientId) => {
+const getPatientInvoices = async (patientId, scope = 'open') => {
     if (!Number.isInteger(Number(patientId)) || Number(patientId) <= 0) return [];
+
+    const statusClause = scope === 'paid'
+        ? 'AND i.status = "paid"'
+        : scope === 'all'
+            ? 'AND i.status <> "cancelled"'
+            : 'AND i.status IN ("unpaid", "partial")';
 
     const [rows] = await pool.query(
         `SELECT
@@ -441,9 +1404,82 @@ const getPatientInvoices = async (patientId) => {
          JOIN Appointments a ON a.id = i.appointmentId
          LEFT JOIN InvoiceItems ii ON ii.invoiceId = i.id
          WHERE i.patientId = ?
-           AND i.status IN ("unpaid", "partial")
+           ${statusClause}
          GROUP BY i.id, i.totalAmount, i.paidAmount, i.status, i.paymentMethod, a.appointmentDate
          ORDER BY i.createdAt DESC
+         LIMIT 5`,
+        [patientId]
+    );
+
+    return rows;
+};
+
+const getPatientMedicalRecords = async (patientId) => {
+    if (!Number.isInteger(Number(patientId)) || Number(patientId) <= 0) return [];
+
+    const [rows] = await pool.query(
+        `SELECT
+            m.id,
+            m.appointmentId,
+            m.diagnosis,
+            m.chiefComplaint,
+            m.treatmentPlan,
+            m.procedures,
+            m.prescription,
+            m.notes,
+            m.nextAppointmentDate,
+            m.nextAppointmentNote,
+            m.createdAt,
+            a.appointmentDate,
+            a.appointmentTime,
+            dentist.fullName as dentistName,
+            GROUP_CONCAT(s.name ORDER BY s.name SEPARATOR ', ') as serviceNames
+         FROM MedicalRecords m
+         JOIN Appointments a ON a.id = m.appointmentId
+         LEFT JOIN Users dentist ON dentist.id = m.dentistId
+         LEFT JOIN Appointment_Services aps ON aps.appointmentId = a.id
+         LEFT JOIN Services s ON s.id = aps.serviceId
+         WHERE m.patientId = ?
+         GROUP BY
+            m.id, m.appointmentId, m.diagnosis, m.chiefComplaint, m.treatmentPlan,
+            m.procedures, m.prescription, m.notes, m.nextAppointmentDate,
+            m.nextAppointmentNote, m.createdAt, a.appointmentDate,
+            a.appointmentTime, dentist.fullName
+         ORDER BY a.appointmentDate DESC, a.appointmentTime DESC, m.createdAt DESC
+         LIMIT 5`,
+        [patientId]
+    );
+
+    return rows;
+};
+
+const getPatientFollowUps = async (patientId) => {
+    if (!Number.isInteger(Number(patientId)) || Number(patientId) <= 0) return [];
+
+    const [rows] = await pool.query(
+        `SELECT
+            m.id,
+            m.appointmentId,
+            m.diagnosis,
+            m.nextAppointmentDate,
+            m.nextAppointmentNote,
+            a.appointmentDate,
+            a.appointmentTime,
+            dentist.fullName as dentistName,
+            GROUP_CONCAT(s.name ORDER BY s.name SEPARATOR ', ') as serviceNames
+         FROM MedicalRecords m
+         JOIN Appointments a ON a.id = m.appointmentId
+         LEFT JOIN Users dentist ON dentist.id = m.dentistId
+         LEFT JOIN Appointment_Services aps ON aps.appointmentId = a.id
+         LEFT JOIN Services s ON s.id = aps.serviceId
+         WHERE m.patientId = ?
+           AND m.nextAppointmentDate IS NOT NULL
+           AND m.nextAppointmentDate >= CURDATE()
+         GROUP BY
+            m.id, m.appointmentId, m.diagnosis, m.nextAppointmentDate,
+            m.nextAppointmentNote, a.appointmentDate, a.appointmentTime,
+            dentist.fullName
+         ORDER BY m.nextAppointmentDate ASC
          LIMIT 5`,
         [patientId]
     );
@@ -491,10 +1527,207 @@ const buildPatientInvoiceText = (invoices) => {
     ].join('\n');
 };
 
+const buildPatientAppointmentTextByScope = (appointments, scope = 'upcoming') => {
+    const emptyText = {
+        upcoming: 'Hiện mình chưa thấy lịch hẹn sắp tới nào trong tài khoản của bạn.',
+        all: 'Hiện mình chưa thấy lịch khám nào trong tài khoản của bạn.',
+        completed: 'Hiện mình chưa thấy lịch khám đã hoàn thành trong tài khoản của bạn.',
+        cancelled: 'Hiện mình chưa thấy lịch khám đã hủy trong tài khoản của bạn.',
+        past: 'Hiện mình chưa thấy lịch khám trong quá khứ trong tài khoản của bạn.'
+    }[scope] || 'Hiện mình chưa thấy lịch hẹn phù hợp trong tài khoản của bạn.';
+
+    if (!appointments.length) return emptyText;
+
+    const statusLabels = {
+        pending: 'chờ xác nhận',
+        confirmed: 'đã xác nhận',
+        arrived: 'đã đến',
+        in_progress: 'đang khám',
+        completed: 'hoàn thành',
+        cancelled: 'đã hủy',
+        no_show: 'không đến'
+    };
+
+    const title = {
+        upcoming: 'Lịch hẹn sắp tới của bạn:',
+        all: 'Các lịch khám gần đây của bạn:',
+        completed: 'Các lịch khám đã hoàn thành của bạn:',
+        cancelled: 'Các lịch khám đã hủy của bạn:',
+        past: 'Các lịch khám trong quá khứ của bạn:'
+    }[scope] || 'Các lịch khám của bạn:';
+
+    return [
+        title,
+        ...appointments.map((appointment, index) => (
+            `${index + 1}. #${appointment.id} - ${String(appointment.appointmentTime).slice(0, 5)} ngày ${formatDate(appointment.appointmentDate)}`
+            + `${appointment.dentistName ? ` với ${appointment.dentistName}` : ''}`
+            + `${appointment.serviceNames ? `, dịch vụ: ${appointment.serviceNames}` : ''}`
+            + ` (${statusLabels[appointment.status] || appointment.status}).`
+        ))
+    ].join('\n');
+};
+
+const buildPatientInvoiceTextByScope = (invoices, scope = 'open') => {
+    if (!invoices.length) {
+        if (scope === 'paid') return 'Hiện mình chưa thấy hóa đơn đã thanh toán trong tài khoản của bạn.';
+        if (scope === 'all') return 'Hiện mình chưa thấy hóa đơn nào trong tài khoản của bạn.';
+        return 'Hiện mình chưa thấy hóa đơn chưa thanh toán trong tài khoản của bạn.';
+    }
+
+    if (scope === 'paid') {
+        return [
+            'Các hóa đơn đã thanh toán của bạn:',
+            ...invoices.map((invoice, index) => {
+                const total = Number(invoice.totalAmount || 0).toLocaleString('vi-VN');
+                return `${index + 1}. INV-${invoice.id}: đã thanh toán ${total} đ`
+                    + `${invoice.itemNames ? `, nội dung: ${invoice.itemNames}` : ''}.`;
+            }),
+            'Bạn có thể mở tab Hóa đơn để xem chi tiết hoặc in/PDF nếu hệ thống hỗ trợ.'
+        ].join('\n');
+    }
+
+    if (scope === 'all') {
+        return [
+            'Các hóa đơn gần đây của bạn:',
+            ...invoices.map((invoice, index) => {
+                const outstanding = Number(invoice.outstandingAmount || 0).toLocaleString('vi-VN');
+                const total = Number(invoice.totalAmount || 0).toLocaleString('vi-VN');
+                const statusText = invoice.status === 'paid'
+                    ? 'đã thanh toán'
+                    : invoice.status === 'partial'
+                        ? `còn ${outstanding} đ`
+                        : 'chưa thanh toán';
+                return `${index + 1}. INV-${invoice.id}: ${statusText} / tổng ${total} đ`
+                    + `${invoice.itemNames ? `, nội dung: ${invoice.itemNames}` : ''}.`;
+            })
+        ].join('\n');
+    }
+
+    return [
+        'Các hóa đơn còn cần thanh toán:',
+        ...invoices.map((invoice, index) => {
+            const outstanding = Number(invoice.outstandingAmount || 0).toLocaleString('vi-VN');
+            const total = Number(invoice.totalAmount || 0).toLocaleString('vi-VN');
+            return `${index + 1}. INV-${invoice.id}: còn ${outstanding} đ / tổng ${total} đ`
+                + `${invoice.itemNames ? `, nội dung: ${invoice.itemNames}` : ''}.`;
+        }),
+        'Bạn có thể mở tab Hóa đơn để thanh toán VNPay QR hoặc kiểm tra trạng thái thanh toán.'
+    ].join('\n');
+};
+
+const buildPatientMedicalRecordText = (records) => {
+    if (!records.length) {
+        return 'Hiện mình chưa thấy hồ sơ khám nào trong tài khoản của bạn. Nếu bạn vừa khám xong, bác sĩ có thể chưa hoàn tất ghi hồ sơ.';
+    }
+
+    return [
+        'Hồ sơ khám gần đây của bạn:',
+        ...records.map((record, index) => {
+            const lines = [
+                `${index + 1}. Hồ sơ #${record.id} - lịch #${record.appointmentId}, ngày ${formatDate(record.appointmentDate)}${record.appointmentTime ? ` lúc ${String(record.appointmentTime).slice(0, 5)}` : ''}.`,
+                record.dentistName ? `Bác sĩ: ${record.dentistName}.` : '',
+                record.serviceNames ? `Dịch vụ: ${record.serviceNames}.` : '',
+                record.chiefComplaint ? `Lý do khám: ${record.chiefComplaint}.` : '',
+                record.diagnosis ? `Chẩn đoán: ${record.diagnosis}.` : '',
+                record.treatmentPlan ? `Kế hoạch: ${record.treatmentPlan}.` : '',
+                record.procedures ? `Đã thực hiện: ${record.procedures}.` : '',
+                record.prescription ? `Đơn thuốc/dặn dò: ${record.prescription}.` : '',
+                record.nextAppointmentDate ? `Tái khám: ${formatDate(record.nextAppointmentDate)}${record.nextAppointmentNote ? ` - ${record.nextAppointmentNote}` : ''}.` : ''
+            ].filter(Boolean);
+
+            return lines.join('\n');
+        })
+    ].join('\n\n');
+};
+
+const buildPatientFollowUpText = (records) => {
+    if (!records.length) {
+        return 'Hiện mình chưa thấy lịch tái khám sắp tới trong hồ sơ của bạn.';
+    }
+
+    return [
+        'Lịch tái khám được ghi trong hồ sơ của bạn:',
+        ...records.map((record, index) => (
+            `${index + 1}. ${formatDate(record.nextAppointmentDate)} - từ hồ sơ #${record.id}`
+            + `${record.dentistName ? `, bác sĩ phụ trách: ${record.dentistName}` : ''}`
+            + `${record.diagnosis ? `, chẩn đoán lần trước: ${record.diagnosis}` : ''}`
+            + `${record.nextAppointmentNote ? `, ghi chú: ${record.nextAppointmentNote}` : ''}.`
+        )),
+        'Bạn có thể đặt lịch tái khám theo ngày trên, hoặc nhắn mình ngày/giờ mong muốn để hỗ trợ đặt lịch.'
+    ].join('\n');
+};
+
+const buildPatientOverviewText = ({ appointments, invoices, followUps }) => {
+    const lines = ['Tổng quan tài khoản của bạn:'];
+
+    if (appointments.length) {
+        const next = appointments[0];
+        lines.push(`- Lịch gần nhất: #${next.id} lúc ${String(next.appointmentTime).slice(0, 5)} ngày ${formatDate(next.appointmentDate)}${next.dentistName ? ` với ${next.dentistName}` : ''}.`);
+    } else {
+        lines.push('- Chưa có lịch hẹn sắp tới.');
+    }
+
+    if (followUps.length) {
+        lines.push(`- Tái khám gần nhất cần chú ý: ${formatDate(followUps[0].nextAppointmentDate)} từ hồ sơ #${followUps[0].id}.`);
+    }
+
+    if (invoices.length) {
+        const totalOutstanding = invoices.reduce((sum, invoice) => sum + Number(invoice.outstandingAmount || 0), 0);
+        lines.push(`- Hóa đơn chưa thanh toán: ${invoices.length}, còn tổng ${totalOutstanding.toLocaleString('vi-VN')} đ.`);
+    } else {
+        lines.push('- Không có hóa đơn chưa thanh toán.');
+    }
+
+    return lines.join('\n');
+};
+
+const detectInvoiceScope = (text) => {
+    if (hasAny(text, ['da thanh toan', 'da tra tien', 'da thu tien', 'hoan tat thanh toan', 'thanh toan roi', 'da dong tien'])) {
+        return 'paid';
+    }
+
+    if (hasAny(text, ['tat ca hoa don', 'danh sach hoa don', 'cac hoa don', 'lich su hoa don', 'hoa don gan day'])) {
+        return 'all';
+    }
+
+    return 'open';
+};
+
+const detectAppointmentScope = (text) => {
+    if (hasAny(text, ['lich da huy', 'lich bi huy', 'lich huy', 'da huy'])) return 'cancelled';
+    if (hasAny(text, ['lich da kham', 'da kham', 'da hoan thanh', 'lich hoan thanh', 'kham xong'])) return 'completed';
+    if (hasAny(text, ['lich cu', 'lich qua khu', 'lich truoc day', 'lich da qua'])) return 'past';
+    if (hasAny(text, ['tat ca lich', 'tat ca cac lich', 'danh sach lich', 'cac lich kham', 'lich su lich hen', 'lich su dat lich', 'lich su kham'])) return 'all';
+    return 'upcoming';
+};
+
 const detectPersonalIntent = (text) => ({
-    appointment: hasAny(text, ['lich cua toi', 'lich cua minh', 'lich hen cua toi', 'lich hen cua minh', 'lich sap toi', 'toi co lich', 'xem lich hen', 'lich hom nay']),
-    invoice: hasAny(text, ['hoa don cua toi', 'hoa don cua minh', 'hoa don chua thanh toan', 'xem hoa don', 'toi con no', 'can thanh toan', 'chua thanh toan']),
-    human: hasAny(text, ['gap nhan vien', 'gap le tan', 'can nguoi tu van', 'nhan vien ho tro', 'tu van vien', 'goi lai'])
+    appointment: hasAny(text, [
+        'lich cua toi',
+        'lich cua minh',
+        'lich hen cua toi',
+        'lich hen cua minh',
+        'lich kham cua toi',
+        'lich kham cua minh',
+        'cac lich kham cua toi',
+        'tat ca cac lich kham cua toi',
+        'tat ca lich kham',
+        'danh sach lich kham',
+        'lich sap toi',
+        'toi co lich',
+        'xem lich hen',
+        'kiem tra lich hen',
+        'kiem tra lich kham',
+        'lich hom nay',
+        'lich da kham',
+        'lich da huy',
+        'lich bi huy'
+    ]),
+    invoice: hasAny(text, ['hoa don cua toi', 'hoa don cua minh', 'hoa don chua thanh toan', 'xem hoa don', 'toi con no', 'can thanh toan', 'chua thanh toan', 'da thanh toan', 'da tra tien', 'da thu tien', 'lich su hoa don']),
+    record: hasAny(text, ['ho so kham', 'lich su kham', 'lan truoc toi kham gi', 'lan truoc kham gi', 'toi da kham gi', 'ket qua kham', 'chan doan cua toi', 'don thuoc cua toi', 'phac do dieu tri', 'bac si ghi gi']),
+    followUp: hasAny(text, ['tai kham', 'lich tai kham', 'ngay tai kham', 'khi nao tai kham', 'hen tai kham', 'co lich tai kham khong']),
+    overview: hasAny(text, ['tong quan cua toi', 'thong tin cua toi', 'tai khoan cua toi', 'toi co gi', 'kiem tra tai khoan']),
+    human: isHumanSupportIntent(text)
 });
 
 const buildReply = async (message) => {
@@ -557,6 +1790,7 @@ const buildReply = async (message) => {
 const buildFocusedReply = async (message) => {
     const intent = detectIntent(message);
     const settings = await getSettings();
+    const knowledge = await findKnowledgeMatch(message);
     const lines = [];
 
     if (intent.isClinical) {
@@ -613,6 +1847,11 @@ const buildFocusedReply = async (message) => {
     } else if (intent.isGreeting) {
         lines.push(`Chào bạn, mình là ${ASSISTANT_NAME}.`);
         lines.push('Bạn cần tư vấn dịch vụ, xem lịch trống hay kiểm tra lịch/hóa đơn của mình?');
+    } else if (knowledge) {
+        lines.push(knowledge.answer);
+        if (knowledge.id === 'booking_flow') {
+            lines.push('Bạn nhắn giúp mình dịch vụ/triệu chứng muốn khám trước nhé.');
+        }
     } else {
         lines.push('Bạn mô tả rõ hơn triệu chứng hoặc dịch vụ muốn làm nhé. Mình sẽ gợi ý đúng hơn.');
     }
@@ -629,20 +1868,51 @@ const buildAssistantResponse = async (message, context = {}) => {
     const text = normalizeText(message);
     const intent = detectIntent(message);
     const personalIntent = detectPersonalIntent(text);
+    const appointmentScope = detectAppointmentScope(text);
+    const invoiceScope = detectInvoiceScope(text);
     const settings = await getSettings();
     const patientId = Number(context.patientId || context.user?.id || 0);
     const quickActions = commonActions(settings);
     let responseText = '';
     let needsStaff = false;
     let priorityReason = '';
+    const hasPersonalDataIntent = personalIntent.overview
+        || personalIntent.followUp
+        || personalIntent.record
+        || personalIntent.appointment
+        || personalIntent.invoice;
 
-    if (personalIntent.appointment && patientId > 0) {
-        const appointments = await getPatientAppointments(patientId);
-        responseText = buildPatientAppointmentText(appointments);
+    if (!hasPersonalDataIntent) {
+        const bookingResponse = await buildBookingResponse(message, { patientId, user: context.user || { id: patientId, role: 'patient' } });
+        if (bookingResponse) {
+            return bookingResponse;
+        }
+    }
+
+    if (personalIntent.overview && patientId > 0) {
+        const [appointments, invoices, followUps] = await Promise.all([
+            getPatientAppointments(patientId),
+            getPatientInvoices(patientId),
+            getPatientFollowUps(patientId)
+        ]);
+        responseText = buildPatientOverviewText({ appointments, invoices, followUps });
+        quickActions.unshift(action('Mở hồ sơ', 'route', '/profile'));
+    } else if (personalIntent.followUp && patientId > 0) {
+        const followUps = await getPatientFollowUps(patientId);
+        responseText = buildPatientFollowUpText(followUps);
+        quickActions.unshift(action('Đặt tái khám', 'route', '/booking'));
+        quickActions.unshift(action('Mở hồ sơ khám', 'route', '/profile?tab=history'));
+    } else if (personalIntent.record && patientId > 0) {
+        const records = await getPatientMedicalRecords(patientId);
+        responseText = buildPatientMedicalRecordText(records);
+        quickActions.unshift(action('Mở hồ sơ khám', 'route', '/profile?tab=history'));
+    } else if (personalIntent.appointment && patientId > 0) {
+        const appointments = await getPatientAppointments(patientId, appointmentScope);
+        responseText = buildPatientAppointmentTextByScope(appointments, appointmentScope);
         quickActions.unshift(action('Mở lịch hẹn', 'route', '/profile?tab=appointments'));
     } else if (personalIntent.invoice && patientId > 0) {
-        const invoices = await getPatientInvoices(patientId);
-        responseText = buildPatientInvoiceText(invoices);
+        const invoices = await getPatientInvoices(patientId, invoiceScope);
+        responseText = buildPatientInvoiceTextByScope(invoices, invoiceScope);
         quickActions.unshift(action('Mở hóa đơn', 'route', '/profile?tab=invoices'));
     } else {
         responseText = await buildFocusedReply(message);
@@ -664,11 +1934,47 @@ const buildAssistantResponse = async (message, context = {}) => {
     }
 
     const metadata = {
-        intent: intent.topic?.id || (personalIntent.appointment ? 'patient_appointments' : personalIntent.invoice ? 'patient_invoices' : personalIntent.human ? 'human_support' : 'general'),
+        intent: personalIntent.overview ? 'patient_overview'
+            : personalIntent.followUp ? 'patient_followups'
+                : personalIntent.record ? 'patient_medical_records'
+                    : personalIntent.appointment ? 'patient_appointments'
+                        : personalIntent.invoice ? 'patient_invoices'
+                            : personalIntent.human ? 'human_support'
+                                : intent.topic?.id || 'general',
         needsStaff,
         priorityReason,
-        quickActions: quickActions.slice(0, 4)
+        quickActions: quickActions.slice(0, 4),
+        aiMode: getAiConfig().enabled ? 'external' : 'local'
     };
+    metadata.needsTrainingReview = metadata.intent === 'general' && !intent.isGreeting && !personalIntent.human;
+    metadata.trainingReason = metadata.needsTrainingReview
+        ? 'AI chưa xác định được intent rõ ràng hoặc chưa có tri thức phù hợp.'
+        : '';
+
+    try {
+        const isPersonalDataReply = [
+            'patient_overview',
+            'patient_followups',
+            'patient_medical_records',
+            'patient_appointments',
+            'patient_invoices'
+        ].includes(metadata.intent);
+
+        const aiReply = isPersonalDataReply ? null : await generateAiReply({
+            userMessage: message,
+            draftReply: responseText,
+            settings,
+            metadata
+        });
+
+        if (aiReply) {
+            responseText = aiReply;
+            metadata.aiMode = 'external';
+        }
+    } catch (error) {
+        console.warn('AI chat fallback:', error.message);
+        metadata.aiMode = 'local_fallback';
+    }
 
     return {
         message: responseText,

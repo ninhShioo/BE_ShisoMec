@@ -19,6 +19,7 @@ const settingsRoutes = require('./settings.routes');
 const scheduleRoutes = require('./schedule.routes');
 const reviewRoutes = require('./review.routes');
 const notificationRoutes = require('./notification.routes');
+const aiKnowledgeRoutes = require('./aiKnowledge.routes');
 
 // Đăng ký các routes
 router.use('/auth', authRoutes);
@@ -37,5 +38,6 @@ router.use('/settings', settingsRoutes);
 router.use('/schedules', scheduleRoutes);
 router.use('/reviews', reviewRoutes);
 router.use('/notifications', notificationRoutes);
+router.use('/ai-knowledge', aiKnowledgeRoutes);
 
 module.exports = router;

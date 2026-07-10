@@ -105,14 +105,16 @@ const chatController = {
                     c.createdAt,
                     c.isAssistant,
                     c.metadata,
+                    fb.rating as aiFeedback,
                     IF(c.isAssistant = 1, COALESCE(c.assistantName, 'Trợ lý Phenikaa Dental'), u.fullName) as senderName,
                     IF(c.isAssistant = 1, 'assistant', u.role) as role
                  FROM ChatMessages c
                  JOIN Users u ON c.senderId = u.id
+                 LEFT JOIN AiFeedback fb ON fb.messageId = c.id AND fb.userId = ?
                  WHERE c.senderId = ? OR c.receiverId = ?
                  ORDER BY c.createdAt DESC
                  LIMIT 80`,
-                [patientId, patientId]
+                [req.user.id, patientId, patientId]
             );
 
             res.json({
@@ -122,6 +124,113 @@ const chatController = {
             });
         } catch (error) {
             next(error);
+        }
+    },
+
+    submitMessageFeedback: async (req, res, next) => {
+        const connection = await pool.getConnection();
+
+        try {
+            const messageId = Number(req.params.id);
+            const rating = String(req.body.rating || '').trim();
+            const comment = String(req.body.comment || '').trim().slice(0, 500) || null;
+
+            if (!Number.isInteger(messageId) || messageId <= 0) {
+                return res.status(400).json({ success: false, message: 'ID tin nhắn không hợp lệ.' });
+            }
+
+            if (!['helpful', 'unhelpful'].includes(rating)) {
+                return res.status(400).json({ success: false, message: 'Đánh giá AI không hợp lệ.' });
+            }
+
+            const [messages] = await connection.query(
+                `SELECT id, receiverId, message, metadata, createdAt
+                 FROM ChatMessages
+                 WHERE id = ? AND isAssistant = 1
+                 LIMIT 1`,
+                [messageId]
+            );
+
+            if (messages.length === 0) {
+                return res.status(404).json({ success: false, message: 'Không tìm thấy câu trả lời AI.' });
+            }
+
+            const assistantMessage = messages[0];
+            if (req.user.role === 'patient' && assistantMessage.receiverId !== req.user.id) {
+                return res.status(403).json({ success: false, message: 'Bạn chỉ được đánh giá câu trả lời trong hội thoại của mình.' });
+            }
+
+            await connection.beginTransaction();
+
+            await connection.query(
+                `INSERT INTO AiFeedback (messageId, userId, rating, comment)
+                 VALUES (?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE rating = VALUES(rating), comment = VALUES(comment), updatedAt = NOW()`,
+                [messageId, req.user.id, rating, comment]
+            );
+
+            if (rating === 'unhelpful') {
+                const patientId = assistantMessage.receiverId || req.user.id;
+                const [previousMessages] = await connection.query(
+                    `SELECT message
+                     FROM ChatMessages
+                     WHERE senderId = ?
+                       AND isAssistant = 0
+                       AND createdAt <= ?
+                     ORDER BY createdAt DESC
+                     LIMIT 1`,
+                    [patientId, assistantMessage.createdAt]
+                );
+
+                const previousQuestion = previousMessages[0]?.message;
+                if (previousQuestion) {
+                    let metadata = {};
+                    try {
+                        metadata = JSON.parse(assistantMessage.metadata || '{}');
+                    } catch {
+                        metadata = {};
+                    }
+
+                    const [recentSamples] = await connection.query(
+                        `SELECT id
+                         FROM AiTrainingSamples
+                         WHERE patientId = ?
+                           AND userMessage = ?
+                           AND status = "pending"
+                           AND createdAt >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+                         LIMIT 1`,
+                        [patientId, previousQuestion]
+                    );
+
+                    if (recentSamples.length === 0) {
+                        await connection.query(
+                            `INSERT INTO AiTrainingSamples
+                             (patientId, userMessage, assistantReply, intent, reviewReason)
+                             VALUES (?, ?, ?, ?, ?)`,
+                            [
+                                patientId,
+                                previousQuestion,
+                                assistantMessage.message,
+                                metadata.intent || 'general',
+                                'Khách đánh giá câu trả lời AI là chưa ổn.'
+                            ]
+                        );
+                    }
+                }
+            }
+
+            await connection.commit();
+
+            res.json({
+                success: true,
+                message: rating === 'helpful' ? 'Cảm ơn bạn đã đánh giá câu trả lời.' : 'Đã ghi nhận để cải thiện AI.',
+                data: { messageId, rating }
+            });
+        } catch (error) {
+            await connection.rollback();
+            next(error);
+        } finally {
+            connection.release();
         }
     },
 

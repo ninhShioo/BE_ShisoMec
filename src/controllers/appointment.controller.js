@@ -467,6 +467,133 @@ const validateDentistAvailability = async (connection, dentistId, appointmentDat
     return null;
 };
 
+const createAppointmentRecord = async (connection, {
+    actor,
+    patientId: requestedPatientId,
+    dentistId,
+    appointmentDate,
+    appointmentTime,
+    notes,
+    serviceIds,
+    sourceNote = 'Tạo lịch hẹn'
+}) => {
+    const normalizedServiceIds = normalizeServiceIds(serviceIds);
+    const policySettings = await getAppointmentPolicySettings(connection);
+    const actorRole = actor?.role || 'patient';
+
+    if (actorRole === 'patient') {
+        if (policySettings.maintenanceMode) {
+            throw new Error('Hệ thống đang bảo trì, vui lòng liên hệ hotline để đặt lịch.');
+        }
+
+        if (!policySettings.allowOnlineBooking) {
+            throw new Error('Phòng khám đang tạm ngưng đặt lịch online. Vui lòng liên hệ lễ tân.');
+        }
+    }
+
+    let patientId = actor?.id;
+    if (actorRole === 'admin' || actorRole === 'staff') {
+        if (!requestedPatientId) {
+            throw new Error('Staff/Admin khi đặt lịch hộ cần cung cấp patientId.');
+        }
+        patientId = Number(requestedPatientId);
+    } else if (requestedPatientId && Number(requestedPatientId) !== Number(actor?.id)) {
+        throw new Error('Bạn không thể đặt lịch cho tài khoản khác.');
+    }
+
+    if (!appointmentDate || !appointmentTime || normalizedServiceIds.length === 0) {
+        throw new Error('Vui lòng cung cấp ngày, giờ và ít nhất một dịch vụ.');
+    }
+
+    if (normalizedServiceIds.length > policySettings.maxServicesPerAppointment) {
+        throw new Error(`Mỗi lịch hẹn chỉ được chọn tối đa ${policySettings.maxServicesPerAppointment} dịch vụ.`);
+    }
+
+    const appointmentDateTime = buildAppointmentDateTime(appointmentDate, appointmentTime);
+    if (!appointmentDateTime) {
+        throw new Error('Ngày hoặc giờ hẹn không hợp lệ.');
+    }
+
+    const bookingLeadHours = policySettings.bookingLeadHours;
+    const canCreatePastAppointment = actorRole === 'admin';
+    if (!canCreatePastAppointment && appointmentDateTime < getEarliestBookableDateTime(bookingLeadHours)) {
+        throw new Error(`Cần đặt lịch trước ít nhất ${bookingLeadHours} giờ.`);
+    }
+
+    const [patients] = await connection.query(
+        'SELECT id FROM Users WHERE id = ? AND role = "patient" AND status = "active"',
+        [patientId]
+    );
+    if (patients.length === 0) {
+        throw new Error('Bệnh nhân không tồn tại hoặc đang bị khóa.');
+    }
+
+    if (dentistId) {
+        const [dentists] = await connection.query(
+            'SELECT id FROM Users WHERE id = ? AND role = "dentist" AND status = "active"',
+            [dentistId]
+        );
+        if (dentists.length === 0) {
+            throw new Error('Bác sĩ không tồn tại hoặc đang bị khóa.');
+        }
+    }
+
+    const [validServices] = await connection.query(
+        'SELECT id FROM Services WHERE id IN (?) AND status = "active"',
+        [normalizedServiceIds]
+    );
+    if (validServices.length !== normalizedServiceIds.length) {
+        throw new Error('Danh sách dịch vụ không hợp lệ hoặc có dịch vụ đã bị ẩn.');
+    }
+
+    const appointmentDuration = await getServiceDuration(connection, normalizedServiceIds);
+    const startMinutes = timeToMinutes(appointmentTime);
+
+    if (await hasAppointmentOverlap(connection, 'patientId', patientId, appointmentDate, startMinutes, appointmentDuration)) {
+        throw new Error('Bệnh nhân đã có lịch hẹn khác trong khoảng thời gian này.');
+    }
+
+    if (dentistId) {
+        const dentistAvailabilityError = await validateDentistAvailability(
+            connection,
+            Number(dentistId),
+            appointmentDate,
+            appointmentTime,
+            appointmentDuration
+        );
+
+        if (dentistAvailabilityError) {
+            throw new Error(dentistAvailabilityError);
+        }
+    }
+
+    const [apptResult] = await connection.query(
+        'INSERT INTO Appointments (patientId, dentistId, appointmentDate, appointmentTime, notes) VALUES (?, ?, ?, ?, ?)',
+        [patientId, dentistId || null, appointmentDate, appointmentTime, notes || null]
+    );
+    const appointmentId = apptResult.insertId;
+    await recordAppointmentStatusHistory(connection, appointmentId, null, 'pending', actor?.id, null, sourceNote);
+
+    for (const serviceId of normalizedServiceIds) {
+        await connection.query(
+            'INSERT INTO Appointment_Services (appointmentId, serviceId) VALUES (?, ?)',
+            [appointmentId, serviceId]
+        );
+    }
+
+    if (policySettings.notifyStaffOnNewAppointment) {
+        await createNotificationsForRoles(
+            connection,
+            ['admin', 'staff'],
+            'Lịch hẹn mới',
+            `Có lịch hẹn #${appointmentId} mới cần kiểm tra và xác nhận.`,
+            'appointment'
+        );
+    }
+
+    return { appointmentId, patientId, policySettings };
+};
+
 const appointmentController = {
     getAvailableSlots: async (req, res, next) => {
         try {
@@ -564,116 +691,16 @@ const appointmentController = {
             await connection.beginTransaction();
 
             const { dentistId, appointmentDate, appointmentTime, notes, serviceIds } = req.body;
-            const normalizedServiceIds = normalizeServiceIds(serviceIds);
-            const policySettings = await getAppointmentPolicySettings(connection);
-
-            if (req.user.role === 'patient') {
-                if (policySettings.maintenanceMode) {
-                    throw new Error('Hệ thống đang bảo trì, vui lòng liên hệ hotline để đặt lịch.');
-                }
-
-                if (!policySettings.allowOnlineBooking) {
-                    throw new Error('Phòng khám đang tạm ngưng đặt lịch online. Vui lòng liên hệ lễ tân.');
-                }
-            }
-
-            let patientId = req.user.id;
-            if (req.user.role === 'admin' || req.user.role === 'staff') {
-                if (!req.body.patientId) {
-                    throw new Error('Staff/Admin khi đặt lịch hộ cần cung cấp patientId.');
-                }
-                patientId = Number(req.body.patientId);
-            }
-
-            if (!appointmentDate || !appointmentTime || normalizedServiceIds.length === 0) {
-                throw new Error('Vui lòng cung cấp ngày, giờ và ít nhất một dịch vụ.');
-            }
-
-            if (normalizedServiceIds.length > policySettings.maxServicesPerAppointment) {
-                throw new Error(`Mỗi lịch hẹn chỉ được chọn tối đa ${policySettings.maxServicesPerAppointment} dịch vụ.`);
-            }
-
-            const appointmentDateTime = buildAppointmentDateTime(appointmentDate, appointmentTime);
-            if (!appointmentDateTime) {
-                throw new Error('Ngày hoặc giờ hẹn không hợp lệ.');
-            }
-
-            const bookingLeadHours = policySettings.bookingLeadHours;
-            const canCreatePastAppointment = req.user.role === 'admin';
-            if (!canCreatePastAppointment && appointmentDateTime < getEarliestBookableDateTime(bookingLeadHours)) {
-                throw new Error(`Cần đặt lịch trước ít nhất ${bookingLeadHours} giờ.`);
-            }
-
-            const [patients] = await connection.query(
-                'SELECT id FROM Users WHERE id = ? AND role = "patient" AND status = "active"',
-                [patientId]
-            );
-            if (patients.length === 0) {
-                throw new Error('Bệnh nhân không tồn tại hoặc đang bị khóa.');
-            }
-
-            if (dentistId) {
-                const [dentists] = await connection.query(
-                    'SELECT id FROM Users WHERE id = ? AND role = "dentist" AND status = "active"',
-                    [dentistId]
-                );
-                if (dentists.length === 0) {
-                    throw new Error('Bác sĩ không tồn tại hoặc đang bị khóa.');
-                }
-            }
-
-            const [validServices] = await connection.query(
-                'SELECT id FROM Services WHERE id IN (?) AND status = "active"',
-                [normalizedServiceIds]
-            );
-            if (validServices.length !== normalizedServiceIds.length) {
-                throw new Error('Danh sách dịch vụ không hợp lệ hoặc có dịch vụ đã bị ẩn.');
-            }
-
-            const appointmentDuration = await getServiceDuration(connection, normalizedServiceIds);
-            const startMinutes = timeToMinutes(appointmentTime);
-
-            if (await hasAppointmentOverlap(connection, 'patientId', patientId, appointmentDate, startMinutes, appointmentDuration)) {
-                throw new Error('Bệnh nhân đã có lịch hẹn khác trong khoảng thời gian này.');
-            }
-
-            if (dentistId) {
-                const dentistAvailabilityError = await validateDentistAvailability(
-                    connection,
-                    Number(dentistId),
-                    appointmentDate,
-                    appointmentTime,
-                    appointmentDuration
-                );
-
-                if (dentistAvailabilityError) {
-                    throw new Error(dentistAvailabilityError);
-                }
-            }
-
-            const [apptResult] = await connection.query(
-                'INSERT INTO Appointments (patientId, dentistId, appointmentDate, appointmentTime, notes) VALUES (?, ?, ?, ?, ?)',
-                [patientId, dentistId || null, appointmentDate, appointmentTime, notes || null]
-            );
-            const appointmentId = apptResult.insertId;
-            await recordAppointmentStatusHistory(connection, appointmentId, null, 'pending', req.user.id, null, 'Tạo lịch hẹn');
-
-            for (const serviceId of normalizedServiceIds) {
-                await connection.query(
-                    'INSERT INTO Appointment_Services (appointmentId, serviceId) VALUES (?, ?)',
-                    [appointmentId, serviceId]
-                );
-            }
-
-            if (policySettings.notifyStaffOnNewAppointment) {
-                await createNotificationsForRoles(
-                    connection,
-                    ['admin', 'staff'],
-                    'Lịch hẹn mới',
-                    `Có lịch hẹn #${appointmentId} mới cần kiểm tra và xác nhận.`,
-                    'appointment'
-                );
-            }
+            const { appointmentId } = await createAppointmentRecord(connection, {
+                actor: req.user,
+                patientId: req.body.patientId,
+                dentistId,
+                appointmentDate,
+                appointmentTime,
+                notes,
+                serviceIds,
+                sourceNote: 'Tạo lịch hẹn'
+            });
 
             await connection.commit();
 
@@ -1401,5 +1428,7 @@ const appointmentController = {
         }
     }
 };
+
+appointmentController.createAppointmentRecord = createAppointmentRecord;
 
 module.exports = appointmentController;

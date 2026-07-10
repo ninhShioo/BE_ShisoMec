@@ -7,6 +7,7 @@ router.use(verifyToken);
 
 router.get('/contacts', chatController.getContacts);
 router.get('/history', chatController.getChatHistory);
+router.post('/messages/:id/feedback', chatController.submitMessageFeedback);
 router.put('/conversations/:patientId', chatController.updateConversation);
 
 module.exports = router;

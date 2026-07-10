@@ -164,6 +164,38 @@ const initSocket = (server) => {
                         [assistantSenderId, socket.user.id, response.message, ASSISTANT_NAME, metadata, null]
                     );
 
+                    if (response.metadata?.needsTrainingReview) {
+                        try {
+                            const [recentSamples] = await pool.query(
+                                `SELECT id
+                                 FROM AiTrainingSamples
+                                 WHERE patientId = ?
+                                   AND userMessage = ?
+                                   AND status = "pending"
+                                   AND createdAt >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+                                 LIMIT 1`,
+                                [socket.user.id, message]
+                            );
+
+                            if (recentSamples.length === 0) {
+                                await pool.query(
+                                    `INSERT INTO AiTrainingSamples
+                                     (patientId, userMessage, assistantReply, intent, reviewReason)
+                                     VALUES (?, ?, ?, ?, ?)`,
+                                    [
+                                        socket.user.id,
+                                        message,
+                                        response.message,
+                                        response.metadata.intent || 'general',
+                                        response.metadata.trainingReason || 'Cần admin bổ sung tri thức AI.'
+                                    ]
+                                );
+                            }
+                        } catch (trainingError) {
+                            console.warn('Skipped AI training sample:', trainingError.message);
+                        }
+                    }
+
                     const assistantPayload = {
                         id: assistantResult.insertId,
                         senderId: assistantSenderId,
