@@ -31,7 +31,7 @@ const userController = {
     getAllUsers: async (req, res, next) => {
         try {
             const { role } = req.query;
-            let query = 'SELECT id, fullName, email, phone, role, status, avatar, createdAt FROM Users';
+            let query = 'SELECT id, fullName, email, phone, zaloUserId, role, status, avatar, createdAt FROM Users';
             const queryParams = [];
 
             if (role && !visibleUserRoles.includes(role)) {
@@ -162,7 +162,7 @@ const userController = {
     updateUser: async (req, res, next) => {
         try {
             const targetUserId = Number(req.params.id);
-            const { fullName, phone, role, avatar } = req.body;
+            const { fullName, phone, role, avatar, zaloUserId } = req.body;
 
             if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
                 return res.status(400).json({ success: false, message: 'ID người dùng không hợp lệ.' });
@@ -192,8 +192,13 @@ const userController = {
                 return res.status(400).json({ success: false, message: 'Role không hợp lệ.' });
             }
 
-            let query = 'UPDATE Users SET fullName = ?, phone = ?, avatar = ?';
-            const queryParams = [String(fullName).trim(), phone || null, avatar || null];
+            let query = 'UPDATE Users SET fullName = ?, phone = ?, avatar = ?, zaloUserId = ?';
+            const queryParams = [
+                String(fullName).trim(),
+                phone || null,
+                avatar || null,
+                String(zaloUserId || '').trim() || null
+            ];
 
             if (role && req.user.role === 'admin') {
                 query += ', role = ?';

@@ -92,7 +92,7 @@ const scheduleController = {
                 return res.status(400).json({ success: false, message: 'ID bác sĩ không hợp lệ.' });
             }
 
-            if (req.user.role === 'dentist' && req.user.id !== dentistId) {
+            if (req.user.role === 'dentist' && Number(req.user.id) !== dentistId) {
                 return res.status(403).json({ success: false, message: 'Bạn chỉ được xem lịch làm việc của chính mình.' });
             }
 
@@ -240,7 +240,7 @@ const scheduleController = {
         try {
             const dentistId = Number(req.query.dentistId || req.user.id);
 
-            if (req.user.role === 'dentist' && req.user.id !== dentistId) {
+            if (req.user.role === 'dentist' && Number(req.user.id) !== dentistId) {
                 return res.status(403).json({ success: false, message: 'Bạn chỉ được xem ngày nghỉ của chính mình.' });
             }
 

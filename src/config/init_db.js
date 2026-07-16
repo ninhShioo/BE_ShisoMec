@@ -273,6 +273,7 @@ const runCompatibilityMigrations = async (connection) => {
     await addColumnIfMissing(connection, 'MedicalRecords', 'nextAppointmentNote', 'TEXT');
     await addColumnIfMissing(connection, 'MedicalRecords', 'nextAppointmentReminderSentAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'MedicalRecords', 'nextAppointmentEmailReminderSentAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'MedicalRecords', 'nextAppointmentZaloReminderSentAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'ChatMessages', 'readAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'ChatMessages', 'isAssistant', 'TINYINT(1) DEFAULT 0');
     await addColumnIfMissing(connection, 'ChatMessages', 'assistantName', 'VARCHAR(120) DEFAULT NULL');
@@ -285,6 +286,7 @@ const runCompatibilityMigrations = async (connection) => {
     await addColumnIfMissing(connection, 'Promotions', 'isActive', 'TINYINT(1) DEFAULT 1');
     await addColumnIfMissing(connection, 'Appointments', 'confirmationReminderSentAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'Appointments', 'appointmentReminderEmailSentAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Appointments', 'appointmentReminderZaloSentAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'Appointments', 'statusChangedAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'Appointments', 'checkedInAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'Appointments', 'startedAt', 'TIMESTAMP NULL');
@@ -297,11 +299,15 @@ const runCompatibilityMigrations = async (connection) => {
     await addColumnIfMissing(connection, 'Appointments', 'rescheduleReason', 'TEXT');
     await addColumnIfMissing(connection, 'Invoices', 'subtotalAmount', 'DECIMAL(10, 2) NOT NULL DEFAULT 0');
     await addColumnIfMissing(connection, 'Invoices', 'discountAmount', 'DECIMAL(10, 2) NOT NULL DEFAULT 0');
+    await addColumnIfMissing(connection, 'Invoices', 'promotionId', 'INT NULL');
+    await addColumnIfMissing(connection, 'Invoices', 'promotionName', 'VARCHAR(150) DEFAULT NULL');
+    await addColumnIfMissing(connection, 'Invoices', 'promotionDiscountPercent', 'DECIMAL(5, 2) DEFAULT 0');
     await addColumnIfMissing(connection, 'Invoices', 'paidAmount', 'DECIMAL(10, 2) NOT NULL DEFAULT 0');
     await addColumnIfMissing(connection, 'Invoices', 'note', 'TEXT');
     await addColumnIfMissing(connection, 'Invoices', 'cancelledReason', 'TEXT');
     await addColumnIfMissing(connection, 'Users', 'passwordChangedAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'Users', 'googleLinkedAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Users', 'zaloUserId', 'VARCHAR(80) DEFAULT NULL');
 
     await connection.query(`
         ALTER TABLE Appointments

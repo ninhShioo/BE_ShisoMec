@@ -17,6 +17,40 @@ const money = (value) => {
     return Number.isFinite(amount) ? Math.max(amount, 0) : 0;
 };
 
+const vietnamDateFormatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+});
+
+const getTodayDateOnly = () => vietnamDateFormatter.format(new Date());
+
+const getActivePromotion = async (connectionOrPool, promotionId) => {
+    const normalizedPromotionId = Number(promotionId);
+    if (!Number.isInteger(normalizedPromotionId) || normalizedPromotionId <= 0) return null;
+
+    const today = getTodayDateOnly();
+    const [promotions] = await connectionOrPool.query(
+        `SELECT id, name, discountPercent
+         FROM Promotions
+         WHERE id = ?
+           AND isActive = 1
+           AND (startDate IS NULL OR startDate <= ?)
+           AND (endDate IS NULL OR endDate >= ?)
+         LIMIT 1`,
+        [normalizedPromotionId, today, today]
+    );
+
+    return promotions[0] || null;
+};
+
+const calculatePromotionDiscount = (subtotalAmount, promotion) => {
+    if (!promotion) return 0;
+    const discountPercent = Math.min(Math.max(Number(promotion.discountPercent || 0), 0), 100);
+    return Math.min(money(subtotalAmount), Math.round((money(subtotalAmount) * discountPercent) / 100));
+};
+
 const normalizePublicUrl = (value, fallback) => {
     const candidates = String(value || '')
         .split(',')
@@ -329,10 +363,12 @@ const invoiceController = {
         const connection = await pool.getConnection();
 
         try {
-            const appointmentId = Number(req.body.appointmentId);
-            const invoicePaymentMethod = req.body.paymentMethod || 'cash';
-            const discountAmount = money(req.body.discountAmount);
-            const note = req.body.note ? String(req.body.note).trim() : null;
+            const requestBody = req.body || {};
+            const appointmentId = Number(requestBody.appointmentId);
+            const invoicePaymentMethod = requestBody.paymentMethod || 'cash';
+            const discountAmount = money(requestBody.discountAmount);
+            const promotionId = requestBody.promotionId === undefined || requestBody.promotionId === '' ? null : Number(requestBody.promotionId);
+            const note = requestBody.note ? String(requestBody.note).trim() : null;
 
             if (!Number.isInteger(appointmentId) || appointmentId <= 0) {
                 return res.status(400).json({ success: false, message: 'ID lịch hẹn không hợp lệ.' });
@@ -391,7 +427,13 @@ const invoiceController = {
             }
 
             const subtotalAmount = services.reduce((sum, service) => sum + money(service.price), 0);
-            const safeDiscount = Math.min(discountAmount, subtotalAmount);
+            const promotion = promotionId ? await getActivePromotion(connection, promotionId) : null;
+            if (promotionId && !promotion) {
+                await connection.rollback();
+                return res.status(400).json({ success: false, message: 'Voucher không tồn tại, đã tắt hoặc đã hết hạn.' });
+            }
+            const voucherDiscount = calculatePromotionDiscount(subtotalAmount, promotion);
+            const safeDiscount = Math.min(promotion ? voucherDiscount : discountAmount, subtotalAmount);
             const totalAmount = subtotalAmount - safeDiscount;
 
             if (totalAmount <= 0) {
@@ -401,9 +443,20 @@ const invoiceController = {
 
             const [result] = await connection.query(
                 `INSERT INTO Invoices
-                 (appointmentId, patientId, subtotalAmount, discountAmount, paidAmount, totalAmount, paymentMethod, status, note)
-                 VALUES (?, ?, ?, ?, 0, ?, ?, "unpaid", ?)`,
-                [appointmentId, appointment.patientId, subtotalAmount, safeDiscount, totalAmount, invoicePaymentMethod, note]
+                 (appointmentId, patientId, subtotalAmount, discountAmount, promotionId, promotionName, promotionDiscountPercent, paidAmount, totalAmount, paymentMethod, status, note)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, "unpaid", ?)`,
+                [
+                    appointmentId,
+                    appointment.patientId,
+                    subtotalAmount,
+                    safeDiscount,
+                    promotion?.id || null,
+                    promotion?.name || null,
+                    promotion ? Number(promotion.discountPercent || 0) : 0,
+                    totalAmount,
+                    invoicePaymentMethod,
+                    note
+                ]
             );
             const invoiceId = result.insertId;
 
@@ -436,6 +489,9 @@ const invoiceController = {
                     patientId: appointment.patientId,
                     subtotalAmount,
                     discountAmount: safeDiscount,
+                    promotionId: promotion?.id || null,
+                    promotionName: promotion?.name || null,
+                    promotionDiscountPercent: promotion ? Number(promotion.discountPercent || 0) : 0,
                     paidAmount: 0,
                     totalAmount,
                     outstandingAmount: totalAmount,
@@ -593,8 +649,9 @@ const invoiceController = {
                 return res.status(400).json({ success: false, message: 'Không thể thanh toán hóa đơn đã hủy.' });
             }
 
+            const requestBody = req.body || {};
             const outstandingAmount = Math.max(money(invoice.totalAmount) - money(invoice.paidAmount), 0);
-            const requestedAmount = req.body.amount === undefined ? outstandingAmount : money(req.body.amount);
+            const requestedAmount = requestBody.amount === undefined ? outstandingAmount : money(requestBody.amount);
             if (requestedAmount <= 0 || requestedAmount > outstandingAmount) {
                 return res.status(400).json({ success: false, message: 'Số tiền thanh toán VNPay không hợp lệ.' });
             }
@@ -708,13 +765,105 @@ const invoiceController = {
         }
     },
 
+    applyPromotion: async (req, res, next) => {
+        const connection = await pool.getConnection();
+
+        try {
+            const invoiceId = Number(req.params.id);
+            const requestBody = req.body || {};
+            const promotionId = requestBody.promotionId === undefined || requestBody.promotionId === '' ? null : Number(requestBody.promotionId);
+
+            if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+                return res.status(400).json({ success: false, message: 'ID hóa đơn không hợp lệ.' });
+            }
+
+            if (promotionId !== null && (!Number.isInteger(promotionId) || promotionId <= 0)) {
+                return res.status(400).json({ success: false, message: 'Voucher không hợp lệ.' });
+            }
+
+            await connection.beginTransaction();
+
+            const [invoices] = await connection.query(
+                'SELECT id, patientId, status, subtotalAmount, totalAmount, paidAmount FROM Invoices WHERE id = ? FOR UPDATE',
+                [invoiceId]
+            );
+
+            if (invoices.length === 0) {
+                await connection.rollback();
+                return res.status(404).json({ success: false, message: 'Không tìm thấy hóa đơn.' });
+            }
+
+            const invoice = invoices[0];
+            if (invoice.status === 'paid' || invoice.status === 'partial' || money(invoice.paidAmount) > 0) {
+                await connection.rollback();
+                return res.status(400).json({ success: false, message: 'Chỉ áp voucher khi hóa đơn chưa ghi nhận thanh toán.' });
+            }
+
+            if (invoice.status === 'cancelled') {
+                await connection.rollback();
+                return res.status(400).json({ success: false, message: 'Không thể áp voucher cho hóa đơn đã hủy.' });
+            }
+
+            const subtotalAmount = money(invoice.subtotalAmount || invoice.totalAmount);
+            const promotion = promotionId ? await getActivePromotion(connection, promotionId) : null;
+            if (promotionId && !promotion) {
+                await connection.rollback();
+                return res.status(400).json({ success: false, message: 'Voucher không tồn tại, đã tắt hoặc đã hết hạn.' });
+            }
+
+            const discountAmount = calculatePromotionDiscount(subtotalAmount, promotion);
+            const totalAmount = Math.max(subtotalAmount - discountAmount, 0);
+
+            if (totalAmount <= 0) {
+                await connection.rollback();
+                return res.status(400).json({ success: false, message: 'Voucher làm tổng hóa đơn không hợp lệ.' });
+            }
+
+            await connection.query(
+                `UPDATE Invoices
+                 SET discountAmount = ?,
+                     promotionId = ?,
+                     promotionName = ?,
+                     promotionDiscountPercent = ?,
+                     totalAmount = ?
+                 WHERE id = ?`,
+                [
+                    discountAmount,
+                    promotion?.id || null,
+                    promotion?.name || null,
+                    promotion ? Number(promotion.discountPercent || 0) : 0,
+                    totalAmount,
+                    invoiceId
+                ]
+            );
+
+            await connection.commit();
+
+            const itemsByInvoice = await getInvoiceItems(pool, invoiceId);
+            const paymentsByInvoice = await getInvoicePayments(pool, invoiceId);
+            const [updatedInvoices] = await pool.query('SELECT * FROM Invoices WHERE id = ?', [invoiceId]);
+
+            res.json({
+                success: true,
+                message: promotion ? 'Đã áp voucher cho hóa đơn.' : 'Đã bỏ voucher khỏi hóa đơn.',
+                data: mapInvoice(updatedInvoices[0], itemsByInvoice, paymentsByInvoice)
+            });
+        } catch (error) {
+            await connection.rollback();
+            next(error);
+        } finally {
+            connection.release();
+        }
+    },
+
     payInvoice: async (req, res, next) => {
         const connection = await pool.getConnection();
 
         try {
             const invoiceId = Number(req.params.id);
-            const { paymentMethod = 'cash', transactionId = null } = req.body;
-            const requestedAmount = req.body.amount === undefined ? null : money(req.body.amount);
+            const requestBody = req.body || {};
+            const { paymentMethod = 'cash', transactionId = null } = requestBody;
+            const requestedAmount = requestBody.amount === undefined ? null : money(requestBody.amount);
 
             if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
                 return res.status(400).json({ success: false, message: 'ID hóa đơn không hợp lệ.' });

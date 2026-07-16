@@ -1,6 +1,7 @@
 const pool = require('../config/database');
 const { createNotification, createNotificationsForRoles } = require('../services/notification.service');
 const { isEmailEnabled, sendAppointmentReminderEmail, sendFollowUpReminderEmail } = require('../services/email.service');
+const { isZaloEnabled, sendAppointmentReminderZalo, sendFollowUpReminderZalo } = require('../services/zalo.service');
 
 const getReminderHours = async (connection) => {
     const [rows] = await connection.query(
@@ -14,6 +15,8 @@ const runAppointmentReminderScan = async () => {
     const connection = await pool.getConnection();
     const emailJobs = [];
     const followUpEmailJobs = [];
+    const zaloJobs = [];
+    const followUpZaloJobs = [];
 
     try {
         await connection.beginTransaction();
@@ -65,6 +68,28 @@ const runAppointmentReminderScan = async () => {
             emailJobs.push(...emailAppointments);
         }
 
+        if (isZaloEnabled()) {
+            const [zaloAppointments] = await connection.query(`
+                SELECT a.id, a.appointmentDate, a.appointmentTime,
+                       p.fullName as patientName, p.zaloUserId as patientZaloUserId,
+                       d.fullName as dentistName,
+                       GROUP_CONCAT(DISTINCT s.name ORDER BY s.name SEPARATOR ', ') as serviceNames
+                FROM Appointments a
+                JOIN Users p ON p.id = a.patientId
+                LEFT JOIN Users d ON d.id = a.dentistId
+                LEFT JOIN Appointment_Services aps ON aps.appointmentId = a.id
+                LEFT JOIN Services s ON s.id = aps.serviceId
+                WHERE a.status IN ("confirmed", "arrived")
+                AND a.appointmentReminderZaloSentAt IS NULL
+                AND p.zaloUserId IS NOT NULL
+                AND p.zaloUserId <> ""
+                AND TIMESTAMP(a.appointmentDate, a.appointmentTime) BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL ? HOUR)
+                GROUP BY a.id, a.appointmentDate, a.appointmentTime, p.fullName, p.zaloUserId, d.fullName
+            `, [reminderHours]);
+
+            zaloJobs.push(...zaloAppointments);
+        }
+
         const [followUpRecords] = await connection.query(`
             SELECT
                 m.id,
@@ -76,8 +101,10 @@ const runAppointmentReminderScan = async () => {
                 m.nextAppointmentNote,
                 m.nextAppointmentReminderSentAt,
                 m.nextAppointmentEmailReminderSentAt,
+                m.nextAppointmentZaloReminderSentAt,
                 p.fullName as patientName,
                 p.email as patientEmail,
+                p.zaloUserId as patientZaloUserId,
                 p.googleLinkedAt,
                 d.fullName as dentistName
             FROM MedicalRecords m
@@ -91,6 +118,11 @@ const runAppointmentReminderScan = async () => {
                         AND p.googleLinkedAt IS NOT NULL
                         AND p.email IS NOT NULL
                         AND p.email <> ""
+                    )
+                    OR (
+                        m.nextAppointmentZaloReminderSentAt IS NULL
+                        AND p.zaloUserId IS NOT NULL
+                        AND p.zaloUserId <> ""
                     )
               )
               AND m.nextAppointmentDate <= CURDATE()
@@ -121,6 +153,15 @@ const runAppointmentReminderScan = async () => {
             ) {
                 followUpEmailJobs.push(record);
             }
+
+            if (
+                isZaloEnabled()
+                && record.patientZaloUserId
+                && String(record.patientZaloUserId).trim()
+                && !record.nextAppointmentZaloReminderSentAt
+            ) {
+                followUpZaloJobs.push(record);
+            }
         }
 
         await connection.commit();
@@ -141,6 +182,22 @@ const runAppointmentReminderScan = async () => {
             }
         }
 
+        let sentZalo = 0;
+        for (const appointment of zaloJobs) {
+            try {
+                const result = await sendAppointmentReminderZalo(appointment);
+                if (!result.skipped) {
+                    await pool.query(
+                        'UPDATE Appointments SET appointmentReminderZaloSentAt = NOW() WHERE id = ? AND appointmentReminderZaloSentAt IS NULL',
+                        [appointment.id]
+                    );
+                    sentZalo += 1;
+                }
+            } catch (error) {
+                console.error(`Appointment reminder Zalo #${appointment.id} failed:`, error.message);
+            }
+        }
+
         let sentFollowUpEmails = 0;
         for (const record of followUpEmailJobs) {
             try {
@@ -157,11 +214,29 @@ const runAppointmentReminderScan = async () => {
             }
         }
 
+        let sentFollowUpZalo = 0;
+        for (const record of followUpZaloJobs) {
+            try {
+                const result = await sendFollowUpReminderZalo(record);
+                if (!result.skipped) {
+                    await pool.query(
+                        'UPDATE MedicalRecords SET nextAppointmentZaloReminderSentAt = NOW() WHERE id = ? AND nextAppointmentZaloReminderSentAt IS NULL',
+                        [record.id]
+                    );
+                    sentFollowUpZalo += 1;
+                }
+            } catch (error) {
+                console.error(`Follow-up reminder Zalo #${record.id} failed:`, error.message);
+            }
+        }
+
         return {
             staffReminders: appointments.length,
             emailReminders: sentEmails,
+            zaloReminders: sentZalo,
             followUpReminders: followUpRecords.length,
-            followUpEmailReminders: sentFollowUpEmails
+            followUpEmailReminders: sentFollowUpEmails,
+            followUpZaloReminders: sentFollowUpZalo
         };
     } catch (error) {
         await connection.rollback();
