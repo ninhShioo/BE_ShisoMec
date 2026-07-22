@@ -6,6 +6,14 @@ const managedRoles = ['admin', 'dentist', 'staff'];
 const visibleUserRoles = ['patient', 'dentist', 'staff', 'admin'];
 const staffVisibleRoles = ['patient', 'dentist'];
 const dentistVisibleRoles = ['patient'];
+const normalizeEmail = (email) => String(email || '').trim().toLowerCase();
+const isStrongPassword = (password) => (
+    typeof password === 'string'
+    && password.length >= 8
+    && /[A-Z]/.test(password)
+    && /[a-z]/.test(password)
+    && /\d/.test(password)
+);
 
 const userController = {
     getPublicDentists: async (req, res, next) => {
@@ -78,12 +86,25 @@ const userController = {
 
     createStaff: async (req, res, next) => {
         try {
-            const { fullName, email, password, phone, role, avatar } = req.body;
+            const { fullName, password, phone, role, avatar } = req.body;
+            const email = normalizeEmail(req.body.email);
+            const cleanPassword = String(password || '');
 
-            if (!fullName || !email || !password || !role) {
+            if (!fullName || !email || !cleanPassword || !role) {
                 return res.status(400).json({
                     success: false,
                     message: 'Vui lòng điền đầy đủ họ tên, email, mật khẩu và role.'
+                });
+            }
+
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                return res.status(400).json({ success: false, message: 'Email khÃ´ng há»£p lá»‡.' });
+            }
+
+            if (!isStrongPassword(cleanPassword)) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Máº­t kháº©u cáº§n Ã­t nháº¥t 8 kÃ½ tá»±, cÃ³ chá»¯ hoa, chá»¯ thÆ°á»ng vÃ  sá»‘.'
                 });
             }
 
@@ -100,7 +121,7 @@ const userController = {
             }
 
             const salt = await bcrypt.genSalt(10);
-            const hashedPassword = await bcrypt.hash(password, salt);
+            const hashedPassword = await bcrypt.hash(cleanPassword, salt);
 
             const [result] = await pool.query(
                 'INSERT INTO Users (fullName, email, password, phone, role, avatar) VALUES (?, ?, ?, ?, ?, ?)',
@@ -222,7 +243,7 @@ const userController = {
     resetPassword: async (req, res, next) => {
         try {
             const targetUserId = Number(req.params.id);
-            const defaultPassword = 'nhakhoapremium';
+            const defaultPassword = 'NhaKhoa2026';
 
             if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
                 return res.status(400).json({ success: false, message: 'ID người dùng không hợp lệ.' });
