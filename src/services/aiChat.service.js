@@ -43,6 +43,45 @@ const parseAssistantText = (payload) => {
     return '';
 };
 
+const canonicalFact = (value) => String(value || '')
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/[.,](?=\d)/g, '');
+
+const extractGroundedFacts = (value) => {
+    const text = String(value || '');
+    const patterns = {
+        url: /https?:\/\/[^\s)]+/giu,
+        money: /\d[\d.,]*\s*(?:đ|vnd|đồng)(?=$|\s|[.,;!?])/giu,
+        time: /\b(?:[01]?\d|2[0-3])(?::[0-5]\d|\s*h(?:\s*[0-5]\d)?)\b/giu,
+        phone: /\b\d{8,11}\b/g,
+        entityId: /#\d+\b/g
+    };
+
+    return Object.entries(patterns).flatMap(([type, pattern]) => (
+        [...text.matchAll(pattern)].map((match) => ({
+            type,
+            value: match[0],
+            canonical: canonicalFact(match[0])
+        }))
+    ));
+};
+
+const findUnsupportedFacts = (reply, allowedText) => {
+    const allowedFacts = new Set(extractGroundedFacts(allowedText).map((fact) => `${fact.type}:${fact.canonical}`));
+    return extractGroundedFacts(reply).filter((fact) => !allowedFacts.has(`${fact.type}:${fact.canonical}`));
+};
+
+const validateGroundedReply = ({ reply, draftReply, settings = {}, metadata = {} }) => {
+    if (!reply || !String(reply).trim()) return { valid: false, unsupportedFacts: [] };
+    const allowedText = JSON.stringify({ draftReply, settings, groundingSources: metadata.groundingSources || [] });
+    const unsupportedFacts = findUnsupportedFacts(reply, allowedText);
+    return {
+        valid: unsupportedFacts.length === 0,
+        unsupportedFacts
+    };
+};
+
 const generateAiReply = async ({ userMessage, draftReply, settings, metadata }) => {
     const config = getAiConfig();
     if (!config.enabled) return null;
@@ -80,7 +119,8 @@ const generateAiReply = async ({ userMessage, draftReply, settings, metadata }) 
                                 mapUrl: settings.mapUrl
                             },
                             intent: metadata?.intent || 'general',
-                            needsStaff: Boolean(metadata?.needsStaff)
+                            needsStaff: Boolean(metadata?.needsStaff),
+                            groundingSources: metadata?.groundingSources || []
                         })
                     }
                 ]
@@ -95,13 +135,24 @@ const generateAiReply = async ({ userMessage, draftReply, settings, metadata }) 
 
         const payload = await response.json();
         const aiText = parseAssistantText(payload);
-        return aiText || null;
+        if (!aiText) return null;
+
+        const validation = validateGroundedReply({
+            reply: aiText,
+            draftReply,
+            settings,
+            metadata
+        });
+        return validation.valid ? aiText : null;
     } finally {
         clearTimeout(timer);
     }
 };
 
 module.exports = {
+    extractGroundedFacts,
+    findUnsupportedFacts,
     getAiConfig,
-    generateAiReply
+    generateAiReply,
+    validateGroundedReply
 };

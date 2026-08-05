@@ -1,4 +1,5 @@
 const pool = require('../config/database');
+const { queueTrainingSample } = require('../services/aiQuality.service');
 
 const validConversationStatuses = ['new', 'open', 'closed'];
 
@@ -191,31 +192,16 @@ const chatController = {
                         metadata = {};
                     }
 
-                    const [recentSamples] = await connection.query(
-                        `SELECT id
-                         FROM AiTrainingSamples
-                         WHERE patientId = ?
-                           AND userMessage = ?
-                           AND status = "pending"
-                           AND createdAt >= DATE_SUB(NOW(), INTERVAL 1 DAY)
-                         LIMIT 1`,
-                        [patientId, previousQuestion]
-                    );
-
-                    if (recentSamples.length === 0) {
-                        await connection.query(
-                            `INSERT INTO AiTrainingSamples
-                             (patientId, userMessage, assistantReply, intent, reviewReason)
-                             VALUES (?, ?, ?, ?, ?)`,
-                            [
-                                patientId,
-                                previousQuestion,
-                                assistantMessage.message,
-                                metadata.intent || 'general',
-                                'Khách đánh giá câu trả lời AI là chưa ổn.'
-                            ]
-                        );
-                    }
+                    await queueTrainingSample({
+                        database: connection,
+                        patientId,
+                        userMessage: previousQuestion,
+                        assistantReply: assistantMessage.message,
+                        metadata,
+                        reviewReason: comment
+                            ? `Khách đánh giá chưa ổn: ${comment}`
+                            : 'Khách đánh giá câu trả lời AI là chưa ổn.'
+                    });
                 }
             }
 

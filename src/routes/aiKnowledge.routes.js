@@ -8,6 +8,7 @@ router.use(verifyToken, checkRole(['admin']));
 
 router.get('/training-samples', aiKnowledgeController.getTrainingSamples);
 router.get('/feedback-summary', aiKnowledgeController.getFeedbackSummary);
+router.post('/validate', aiKnowledgeController.validateCandidate);
 router.patch('/training-samples/:id', logActivity('UPDATE_AI_TRAINING_SAMPLE', 'AiTrainingSamples'), aiKnowledgeController.updateTrainingSample);
 router.post('/training-samples/:id/promote', logActivity('PROMOTE_AI_TRAINING_SAMPLE', 'AiTrainingSamples'), aiKnowledgeController.promoteTrainingSample);
 router.get('/', aiKnowledgeController.getAll);

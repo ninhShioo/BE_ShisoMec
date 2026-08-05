@@ -6,8 +6,12 @@ const { setSocketServer } = require('./emitter');
 const chatController = require('../controllers/chat.controller');
 const { ASSISTANT_NAME, buildAssistantResponse, getAssistantSenderId } = require('../services/chatAssistant.service');
 const { createNotification, createNotificationsForRoles } = require('../services/notification.service');
+const { queueTrainingSample } = require('../services/aiQuality.service');
+const { ChatMessageGuard, KeyedTaskQueue } = require('../utils/chatPolicy');
 
 const staffChatNotificationTitle = 'Khach can ho tro chat';
+const chatMessageGuard = new ChatMessageGuard();
+const patientMessageQueue = new KeyedTaskQueue();
 
 const initSocket = (server) => {
     const io = new Server(server, {
@@ -65,8 +69,22 @@ const initSocket = (server) => {
 
         socket.on('send_message', async (data) => {
             try {
-                const message = String(data?.message || '').trim();
-                if (!message) return;
+                if (!['patient', 'staff', 'admin'].includes(socket.user.role)) {
+                    socket.emit('chat_error', { message: 'Tài khoản của bạn không có quyền sử dụng chức năng chat này.' });
+                    return;
+                }
+
+                const guardResult = chatMessageGuard.check({
+                    userId: socket.user.id,
+                    message: data?.message,
+                    clientMessageId: data?.clientMessageId
+                });
+                if (!guardResult.ok) {
+                    if (!guardResult.silent) socket.emit('chat_error', { message: guardResult.message });
+                    return;
+                }
+                const message = guardResult.message;
+                const clientMessageId = guardResult.clientMessageId;
 
                 let receiverId = data?.receiverId ? Number(data.receiverId) : null;
                 let patientRoomId = socket.user.role === 'patient' ? socket.user.id : receiverId;
@@ -81,6 +99,7 @@ const initSocket = (server) => {
                     patientRoomId = socket.user.id;
                 }
 
+                await patientMessageQueue.run(`patient:${patientRoomId}`, async () => {
                 await chatController.ensureConversation(
                     pool,
                     patientRoomId,
@@ -99,8 +118,11 @@ const initSocket = (server) => {
                     senderName: socket.user.fullName,
                     role: socket.user.role,
                     message,
+                    clientMessageId,
                     createdAt: new Date()
                 };
+
+                socket.emit('chat_message_ack', { clientMessageId, messageId: result.insertId });
 
                 io.to(`chat:patient:${patientRoomId}`).emit('receive_message', payload);
                 io.to('chat:staff').emit('receive_message', { ...payload, patientId: patientRoomId });
@@ -117,12 +139,20 @@ const initSocket = (server) => {
 
                 if (socket.user.role === 'patient') {
                     const assistantSenderId = await getAssistantSenderId();
-                    if (!assistantSenderId) return;
+                    if (!assistantSenderId) {
+                        io.to(`chat:patient:${patientRoomId}`).emit('assistant_typing', { typing: false });
+                        socket.emit('chat_error', { message: 'Trợ lý đang tạm thời không khả dụng. Vui lòng gặp nhân viên hỗ trợ.' });
+                        return;
+                    }
 
                     io.to(`chat:patient:${patientRoomId}`).emit('assistant_typing', { typing: true });
 
                     const response = await buildAssistantResponse(message, { patientId: socket.user.id, user: socket.user });
-                    if (!response?.message) return;
+                    if (!response?.message) {
+                        io.to(`chat:patient:${patientRoomId}`).emit('assistant_typing', { typing: false });
+                        socket.emit('chat_error', { message: 'Trợ lý chưa thể xử lý tin nhắn này. Vui lòng thử lại.' });
+                        return;
+                    }
                     const metadata = JSON.stringify(response.metadata || {});
 
                     if (response.needsStaff) {
@@ -166,31 +196,13 @@ const initSocket = (server) => {
 
                     if (response.metadata?.needsTrainingReview) {
                         try {
-                            const [recentSamples] = await pool.query(
-                                `SELECT id
-                                 FROM AiTrainingSamples
-                                 WHERE patientId = ?
-                                   AND userMessage = ?
-                                   AND status = "pending"
-                                   AND createdAt >= DATE_SUB(NOW(), INTERVAL 1 DAY)
-                                 LIMIT 1`,
-                                [socket.user.id, message]
-                            );
-
-                            if (recentSamples.length === 0) {
-                                await pool.query(
-                                    `INSERT INTO AiTrainingSamples
-                                     (patientId, userMessage, assistantReply, intent, reviewReason)
-                                     VALUES (?, ?, ?, ?, ?)`,
-                                    [
-                                        socket.user.id,
-                                        message,
-                                        response.message,
-                                        response.metadata.intent || 'general',
-                                        response.metadata.trainingReason || 'Cần admin bổ sung tri thức AI.'
-                                    ]
-                                );
-                            }
+                            await queueTrainingSample({
+                                database: pool,
+                                patientId: socket.user.id,
+                                userMessage: message,
+                                assistantReply: response.message,
+                                metadata: response.metadata
+                            });
                         } catch (trainingError) {
                             console.warn('Skipped AI training sample:', trainingError.message);
                         }
@@ -217,11 +229,13 @@ const initSocket = (server) => {
                         priorityReason: response.priorityReason
                     });
                 }
+                });
             } catch (error) {
                 console.error('Socket send_message error:', error.message);
                 if (socket.user.role === 'patient') {
                     io.to(`chat:patient:${socket.user.id}`).emit('assistant_typing', { typing: false });
                 }
+                socket.emit('chat_error', { message: 'Không thể gửi tin nhắn lúc này. Vui lòng thử lại.' });
             }
         });
 

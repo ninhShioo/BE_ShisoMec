@@ -13,14 +13,16 @@ const pool = mysql.createPool({
     queueLimit: 0
 });
 
-// Kiểm tra kết nối
-pool.getConnection()
-    .then((connection) => {
-        console.log('Connected to MySQL database successfully!');
-        connection.release();
-    })
-    .catch((err) => {
-        console.error('Error connecting to MySQL database:', err.message);
-    });
+// Không tạo kết nối ngầm khi unit test chỉ import service thuần.
+if (process.env.NODE_ENV !== 'test') {
+    pool.getConnection()
+        .then((connection) => {
+            console.log('Connected to MySQL database successfully!');
+            connection.release();
+        })
+        .catch((err) => {
+            console.error('Error connecting to MySQL database:', err.message);
+        });
+}
 
 module.exports = pool;

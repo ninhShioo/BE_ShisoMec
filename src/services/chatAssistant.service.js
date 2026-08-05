@@ -1,17 +1,43 @@
 const pool = require('../config/database');
 const { generateAiReply, getAiConfig } = require('./aiChat.service');
-const { createAppointmentRecord } = require('../controllers/appointment.controller');
+const { publicBookingError } = require('../utils/chatPolicy');
+const {
+    detectAppointmentScope,
+    detectBookingEditIntent,
+    detectIntentMessage,
+    detectInvoiceScope,
+    detectPersonalIntent,
+    findBestByKeywords,
+    getChoiceNumber,
+    hasAny,
+    isBookingConfirmIntent,
+    isBookingStartIntent,
+    isCancelBookingDraft,
+    isGenericConsultIntent,
+    isHumanSupportIntent,
+    isNewConsultationIntent,
+    normalizeText,
+    parseRequestedDate,
+    parseRequestedTime,
+    parseRequestedTimeWindow,
+    pickNumberedChoice,
+    scoreKeywords,
+    shouldClarifyIntent
+} = require('./chatIntent.service');
+const {
+    applyBookingEdit,
+    clearConversationAssistantState,
+    createBookingDraft,
+    createIntentClarificationState,
+    getConversationAssistantState,
+    resolveIntentClarification,
+    saveConversationAssistantState
+} = require('./chatDialogue.service');
+const { createAppointmentFromChat } = require('./chatAppointmentTool.service');
+const { createKnowledgeRetriever, toSourceMetadata } = require('./chatKnowledge.service');
+const { attachQualityTelemetry } = require('./aiQuality.service');
 
 const ASSISTANT_NAME = 'Trợ lý AI Phenikaa Dental';
-
-const normalizeText = (value) => String(value || '')
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[\u0111\u0110]/g, 'd')
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
 
 const timeToMinutes = (time) => {
     const [hour, minute] = String(time || '00:00').slice(0, 5).split(':').map(Number);
@@ -234,6 +260,12 @@ const knowledgeBase = [
     }
 ];
 
+const knowledgeRetriever = createKnowledgeRetriever({
+    database: pool,
+    builtinItems: knowledgeBase,
+    threshold: Number(process.env.AI_KNOWLEDGE_MIN_SCORE || 0.48)
+});
+
 const operationTopics = {
     payment: ['thanh toan', 'vnpay', 'qr', 'hoa don', 'chuyen khoan', 'tien mat', 'the', 'da thanh toan'],
     reschedule: ['doi lich', 'huy lich', 'doi gio', 'doi ngay', 'doi bac si', 'tre lich', 'khong den duoc'],
@@ -241,51 +273,6 @@ const operationTopics = {
     location: ['dia chi', 'map', 'duong di', 'den dau', 'phong nao', 'gap ai', 'check in'],
     doctor: ['bac si nao', 'nen chon bac si', 'ai kham', 'bac si gioi', 'bac si trong'],
     opening: ['gio lam viec', 'mo cua', 'dong cua', 'hotline', 'so dien thoai']
-};
-
-const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-const hasKeyword = (text, keyword) => {
-    const normalizedKeyword = normalizeText(keyword);
-    if (!normalizedKeyword) return false;
-    return new RegExp(`(^|\\s)${escapeRegExp(normalizedKeyword)}(\\s|$)`).test(text);
-};
-
-const hasAny = (text, keywords) => keywords.some((keyword) => hasKeyword(text, keyword));
-
-const uniqueTokens = (text) => [...new Set(normalizeText(text).split(' ').filter((token) => token.length >= 3))];
-
-const scoreKeywords = (text, keywords) => {
-    const normalizedText = normalizeText(text);
-    const textTokens = uniqueTokens(normalizedText);
-    let score = 0;
-
-    keywords.forEach((keyword) => {
-        const normalizedKeyword = normalizeText(keyword);
-        if (!normalizedKeyword) return;
-
-        if (normalizedText.includes(normalizedKeyword)) {
-            score += normalizedKeyword.split(' ').length >= 2 ? 6 : 3;
-            return;
-        }
-
-        const keywordTokens = uniqueTokens(normalizedKeyword);
-        const matchedTokens = keywordTokens.filter((token) => textTokens.includes(token));
-        if (keywordTokens.length > 0 && matchedTokens.length > 0) {
-            score += matchedTokens.length / keywordTokens.length >= 0.75 ? 3 : matchedTokens.length;
-        }
-    });
-
-    return score;
-};
-
-const findBestByKeywords = (items, text, threshold = 2) => {
-    const ranked = items
-        .map((item) => ({ item, score: scoreKeywords(text, item.keywords || []) }))
-        .filter((entry) => entry.score >= threshold)
-        .sort((a, b) => b.score - a.score);
-
-    return ranked[0]?.item || null;
 };
 
 const getSettings = async () => {
@@ -421,41 +408,7 @@ const findTopic = (text) => (
     || findBestByKeywords(topicCatalog, text, 2)
 );
 
-const findKnowledge = (text) => (
-    knowledgeBase.find((item) => hasAny(text, item.keywords))
-    || findBestByKeywords(knowledgeBase, text, 2)
-);
-
-const getDbKnowledgeItems = async () => {
-    try {
-        const [rows] = await pool.query(
-            `SELECT id, title, category, keywords, answer
-             FROM AiKnowledge
-             WHERE isActive = 1
-             ORDER BY updatedAt DESC
-             LIMIT 100`
-        );
-
-        return rows.map((row) => ({
-            id: `db_${row.id}`,
-            title: row.title,
-            category: row.category,
-            keywords: String(row.keywords || row.title || '').split(',').map((item) => item.trim()).filter(Boolean),
-            answer: row.answer
-        }));
-    } catch {
-        return [];
-    }
-};
-
-const findKnowledgeMatch = async (text) => {
-    const dbItems = await getDbKnowledgeItems();
-    return (
-        dbItems.find((item) => hasAny(text, item.keywords))
-        || findBestByKeywords(dbItems, text, 2)
-        || findKnowledge(text)
-    );
-};
+const findKnowledgeMatch = async (text) => knowledgeRetriever.retrieve(text, { limit: 3 });
 
 const getRelevantServices = async (topic, text) => {
     const [services] = await pool.query(
@@ -508,26 +461,11 @@ const buildLocationText = (settings) => {
     return lines.join('\n');
 };
 
-const detectIntent = (message) => {
-    const text = normalizeText(message);
-    const topic = findTopic(text);
-
-    return {
-        text,
-        topic,
-        isClinical: Boolean(topic),
-        isBooking: hasAny(text, ['dat lich', 'dang ky', 'lich kham', 'hen kham', 'booking']),
-        isSlot: hasAny(text, ['trong', 'gan nhat', 'it nguoi', 'luc nao', 'thoi diem', 'gio nao', 'bac si nao', 'slot']),
-        isProcedure: hasAny(text, ['quy trinh', 'den dau', 'phong nao', 'gap ai', 'map', 'duong di', 'dia chi', 'check in']),
-        isService: hasAny(text, ['dich vu', 'gia', 'chi phi', 'bao nhieu', 'tu van gia']),
-        isPayment: hasAny(text, operationTopics.payment),
-        isReschedule: hasAny(text, operationTopics.reschedule),
-        isProfile: hasAny(text, operationTopics.profile),
-        isOpening: hasAny(text, operationTopics.opening),
-        isDoctor: hasAny(text, operationTopics.doctor),
-        isGreeting: /^(xin chao|chao|alo|hello|hi|tu van|can tu van)/.test(text)
-    };
-};
+const detectIntent = (message) => detectIntentMessage({
+    message,
+    topic: findTopic(message),
+    operationTopics
+});
 
 const appendSuggestedSlots = async (lines, topic, limit = 3) => {
     const slots = await findAvailableSlots({
@@ -581,36 +519,6 @@ const commonActions = (settings = {}) => [
     ...(settings.mapUrl ? [action('Mở bản đồ', 'url', settings.mapUrl)] : [])
 ];
 
-const parseJsonSafe = (value, fallback = null) => {
-    if (!value) return fallback;
-    if (typeof value === 'object') return value;
-    try {
-        return JSON.parse(value);
-    } catch {
-        return fallback;
-    }
-};
-
-const getConversationAssistantState = async (patientId) => {
-    const [[conversation]] = await pool.query(
-        'SELECT assistantState FROM ChatConversations WHERE patientId = ? LIMIT 1',
-        [patientId]
-    );
-
-    return parseJsonSafe(conversation?.assistantState, null);
-};
-
-const saveConversationAssistantState = async (patientId, state) => {
-    await pool.query(
-        `UPDATE ChatConversations
-         SET assistantState = ?, updatedAt = CURRENT_TIMESTAMP
-         WHERE patientId = ?`,
-        [state ? JSON.stringify(state) : null, patientId]
-    );
-};
-
-const clearConversationAssistantState = (patientId) => saveConversationAssistantState(patientId, null);
-
 const getActiveServices = async () => {
     const [services] = await pool.query(
         `SELECT id, name, price, duration, description
@@ -632,56 +540,6 @@ const getActiveDentists = async () => {
     );
 
     return dentists;
-};
-
-const parseRequestedDate = (text) => {
-    const normalized = normalizeText(text);
-    const now = new Date();
-    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-
-    if (hasAny(normalized, ['ngay mai', 'mai'])) {
-        const next = new Date(today);
-        next.setDate(today.getDate() + 1);
-        return formatDateKey(next);
-    }
-
-    if (hasAny(normalized, ['hom nay', 'today'])) {
-        return formatDateKey(today);
-    }
-
-    const isoMatch = String(text).match(/\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b/);
-    if (isoMatch) {
-        const value = new Date(Number(isoMatch[1]), Number(isoMatch[2]) - 1, Number(isoMatch[3]));
-        if (!Number.isNaN(value.getTime())) return formatDateKey(value);
-    }
-
-    const dateMatch = String(text).match(/\b(\d{1,2})[/-](\d{1,2})(?:[/-](20\d{2}))?\b/);
-    if (dateMatch) {
-        const day = Number(dateMatch[1]);
-        const month = Number(dateMatch[2]);
-        const year = Number(dateMatch[3] || now.getFullYear());
-        const value = new Date(year, month - 1, day);
-        if (!Number.isNaN(value.getTime())) {
-            if (!dateMatch[3] && value < today) value.setFullYear(value.getFullYear() + 1);
-            return formatDateKey(value);
-        }
-    }
-
-    return '';
-};
-
-const parseRequestedTime = (text) => {
-    const raw = String(text || '').toLowerCase();
-    const explicitMatch = raw.match(/\b([01]?\d|2[0-3])\s*(?::|h|giờ|gio)\s*([0-5]\d)?\b/);
-    const bareHourMatch = raw.trim().match(/^([01]?\d|2[0-3])$/);
-    const match = explicitMatch || bareHourMatch;
-    if (!match) return '';
-
-    const hour = Number(match[1]);
-    const minute = match[2] ? Number(match[2]) : 0;
-    if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return '';
-
-    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
 };
 
 const matchServicesFromText = (services, text) => {
@@ -789,7 +647,15 @@ const getDurationForServices = async (serviceIds) => {
     return Math.max(Number(rows[0]?.totalDuration || 0), 30);
 };
 
-const findSlotsForDentistDate = async ({ dentistId, date, serviceIds, limit = 8 }) => {
+const isSlotInTimeWindow = (startMinutes, duration, timeWindow) => {
+    if (!timeWindow) return true;
+    const windowStart = Number(timeWindow.startMinutes);
+    const windowEnd = Number(timeWindow.endMinutes);
+    if (!Number.isFinite(windowStart) || !Number.isFinite(windowEnd)) return true;
+    return startMinutes >= windowStart && startMinutes + duration <= windowEnd;
+};
+
+const findSlotsForDentistDate = async ({ dentistId, date, serviceIds, limit = 8, timeWindow = null }) => {
     const duration = await getDurationForServices(serviceIds);
     const settings = await getSettings();
     const earliestBookable = getEarliestBookableDateTime(settings.bookingLeadHours);
@@ -825,7 +691,7 @@ const findSlotsForDentistDate = async ({ dentistId, date, serviceIds, limit = 8 
         const inBreak = breakStart !== null && breakEnd !== null && rangesOverlap(minutes, slotEnd, breakStart, breakEnd);
         const isBooked = busyRanges.some((range) => rangesOverlap(minutes, slotEnd, range.start, range.end));
 
-        if (dateTime >= earliestBookable && !inBreak && !isBooked) {
+        if (dateTime >= earliestBookable && !inBreak && !isBooked && isSlotInTimeWindow(minutes, duration, timeWindow)) {
             slots.push({ time, date, dentistId });
         }
     }
@@ -852,112 +718,6 @@ const formatDentistsForQuestion = (dentists) => (
     dentists.slice(0, 5).map((dentist, index) => `${index + 1}. ${dentist.fullName}`).join('\n')
 );
 
-const getChoiceNumber = (message) => {
-    const match = String(message || '').trim().match(/^(?:so|số|chon|chọn)?\s*(\d{1,2})$/i);
-    if (!match) return null;
-    const value = Number(match[1]);
-    return Number.isInteger(value) && value > 0 ? value : null;
-};
-
-const pickNumberedChoice = (items, choiceNumber) => {
-    if (!choiceNumber || !Array.isArray(items)) return null;
-    return items[choiceNumber - 1] || null;
-};
-
-const isBookingStartIntent = (text) => hasAny(text, [
-    'dat lich',
-    'dang ky lich',
-    'hen lich',
-    'muon kham',
-    'muon dat',
-    'dat ho',
-    'dang ky kham',
-    'hen bac si',
-    'can kham',
-    'muon gap bac si',
-    'xep lich',
-    'kham rang'
-]) || scoreKeywords(text, knowledgeBase.find((item) => item.id === 'booking_flow')?.keywords || []) >= 2;
-
-const isGenericConsultIntent = (text) => {
-    const normalized = normalizeText(text);
-    return hasAny(normalized, ['tu van', 'can tu van', 'toi muon tu van', 'hoi tu van'])
-        && !findTopic(normalized)
-        && !hasAny(normalized, ['dat lich', 'dang ky', 'hen lich', 'gia', 'chi phi', 'nieng', 'implant', 'rang su', 'tay trang']);
-};
-
-const isNewConsultationIntent = (text) => hasAny(text, [
-    'tu van cai khac',
-    'hoi cai khac',
-    'doi van de',
-    'tu van lai',
-    'bat dau lai',
-    'van de khac'
-]);
-
-const isHumanSupportIntent = (text) => hasAny(text, [
-    'gap nhan vien',
-    'gap le tan',
-    'can nguoi tu van',
-    'nhan vien ho tro',
-    'tu van vien',
-    'goi lai',
-    'noi chuyen voi nguoi that',
-    'nguoi that ho tro'
-]);
-
-const isCancelBookingDraft = (text) => hasAny(text, [
-    'huy dat lich',
-    'bo qua dat lich',
-    'khong dat nua',
-    'dung dat lich'
-]);
-
-const isBookingConfirmIntent = (text) => hasAny(text, [
-    'xac nhan',
-    'dong y',
-    'ok',
-    'oke',
-    'dung roi',
-    'chot lich',
-    'dat lich nay',
-    'tao lich',
-    'dat di'
-]);
-
-const detectBookingEditIntent = (text) => {
-    if (hasAny(text, ['doi dich vu', 'chon dich vu khac', 'sua dich vu', 'doi trieu chung'])) return 'service';
-    if (hasAny(text, ['doi ngay', 'sua ngay', 'ngay khac', 'chon ngay khac'])) return 'date';
-    if (hasAny(text, ['doi bac si', 'sua bac si', 'chon bac si khac'])) return 'dentist';
-    if (hasAny(text, ['doi gio', 'sua gio', 'gio khac', 'chon gio khac', 'doi khung gio'])) return 'time';
-    return '';
-};
-
-const applyBookingEditIntent = (draft, editIntent) => {
-    const nextDraft = { ...draft };
-    if (editIntent === 'service') {
-        nextDraft.serviceIds = [];
-        nextDraft.triageTopicId = '';
-        nextDraft.triageDone = false;
-        nextDraft.notes = '';
-    }
-    if (editIntent === 'date') {
-        nextDraft.appointmentDate = '';
-        nextDraft.appointmentTime = '';
-        nextDraft.appointmentTimeSource = '';
-    }
-    if (editIntent === 'dentist') {
-        nextDraft.dentistId = null;
-        nextDraft.appointmentTime = '';
-        nextDraft.appointmentTimeSource = '';
-    }
-    if (editIntent === 'time') {
-        nextDraft.appointmentTime = '';
-        nextDraft.appointmentTimeSource = '';
-    }
-    return nextDraft;
-};
-
 const bookingConfirmActions = () => [
     action('Xác nhận đặt lịch', 'message', 'Xác nhận đặt lịch'),
     action('Đổi ngày', 'message', 'Đổi ngày'),
@@ -974,6 +734,7 @@ const buildDraftSummary = (draft, services, dentists) => {
         serviceNames ? `Dịch vụ: ${serviceNames}` : '',
         draft.triageTopicId ? `Định hướng: ${getTopicById(draft.triageTopicId)?.label || draft.triageTopicId}` : '',
         draft.appointmentDate ? `Ngày: ${formatDate(draft.appointmentDate)}` : '',
+        draft.timeWindow?.label && !draft.appointmentTime ? `Khung giờ: ${draft.timeWindow.label}` : '',
         draft.appointmentTime ? `Giờ: ${draft.appointmentTime}` : '',
         dentistName ? `Bác sĩ: ${dentistName}` : ''
     ].filter(Boolean).join('\n');
@@ -986,7 +747,8 @@ const buildBookingResponse = async (message, { patientId, user }) => {
     const existingState = await getConversationAssistantState(patientId);
     const isInBookingFlow = existingState?.mode === 'booking';
 
-    if (!isInBookingFlow && !isBookingStartIntent(text)) return null;
+    const bookingKeywords = knowledgeBase.find((item) => item.id === 'booking_flow')?.keywords || [];
+    if (!isInBookingFlow && !isBookingStartIntent(text, bookingKeywords)) return null;
 
     if (isHumanSupportIntent(text)) {
         await clearConversationAssistantState(patientId);
@@ -1008,7 +770,7 @@ const buildBookingResponse = async (message, { patientId, user }) => {
         };
     }
 
-    if (isGenericConsultIntent(text) || isNewConsultationIntent(text)) {
+    if (isGenericConsultIntent(text, findTopic(text)) || isNewConsultationIntent(text)) {
         await clearConversationAssistantState(patientId);
         return {
             message: [
@@ -1045,20 +807,10 @@ const buildBookingResponse = async (message, { patientId, user }) => {
 
     const services = await getActiveServices();
     const dentists = await getActiveDentists();
-    const draft = {
-        serviceIds: [],
-        appointmentDate: '',
-        appointmentTime: '',
-        appointmentTimeSource: '',
-        dentistId: null,
-        triageTopicId: '',
-        triageDone: false,
-        notes: '',
-        ...(existingState?.draft || {})
-    };
+    const draft = createBookingDraft(existingState);
     const editIntent = detectBookingEditIntent(text);
     if (editIntent) {
-        const editedDraft = applyBookingEditIntent(draft, editIntent);
+        const editedDraft = applyBookingEdit(draft, editIntent);
         await saveConversationAssistantState(patientId, {
             mode: 'booking',
             draft: editedDraft,
@@ -1152,10 +904,20 @@ const buildBookingResponse = async (message, { patientId, user }) => {
     const requestedDate = parseRequestedDate(message);
     if (requestedDate) draft.appointmentDate = requestedDate;
 
-    const requestedTime = choiceNumber && ['service', 'dentist', 'time'].includes(existingState?.lastPrompt) ? '' : parseRequestedTime(message);
+    const requestedTimeWindow = parseRequestedTimeWindow(message);
+    const requestedTime = choiceNumber && ['service', 'dentist', 'time'].includes(existingState?.lastPrompt)
+        ? ''
+        : ['after', 'before', 'range'].includes(requestedTimeWindow?.source)
+            ? ''
+            : parseRequestedTime(message);
     if (requestedTime) {
         draft.appointmentTime = requestedTime;
         draft.appointmentTimeSource = 'explicit';
+        draft.timeWindow = null;
+    } else if (requestedTimeWindow) {
+        draft.appointmentTime = '';
+        draft.appointmentTimeSource = '';
+        draft.timeWindow = requestedTimeWindow;
     }
 
     const dentistMatch = matchDentistFromText(dentists, message);
@@ -1239,7 +1001,8 @@ const buildBookingResponse = async (message, { patientId, user }) => {
             dentistId: draft.dentistId,
             date: draft.appointmentDate,
             serviceIds: draft.serviceIds,
-            limit: 6
+            limit: 6,
+            timeWindow: draft.timeWindow
         });
         await saveConversationAssistantState(patientId, {
             ...state,
@@ -1252,8 +1015,8 @@ const buildBookingResponse = async (message, { patientId, user }) => {
             message: [
                 'Bạn muốn khám giờ nào?',
                 slots.length
-                    ? `Các giờ còn trống ngày ${formatDate(draft.appointmentDate)}:\n${slots.map((slot, index) => `${index + 1}. ${slot.time}`).join('\n')}\nBạn có thể nhập số thứ tự hoặc giờ cụ thể.`
-                    : 'Ngày này hiện chưa thấy khung giờ trống với bác sĩ đã chọn. Bạn có thể đổi ngày hoặc đổi bác sĩ.'
+                    ? `Các giờ còn trống ngày ${formatDate(draft.appointmentDate)}${draft.timeWindow?.label ? ` trong ${draft.timeWindow.label}` : ''}:\n${slots.map((slot, index) => `${index + 1}. ${slot.time}`).join('\n')}\nBạn có thể nhập số thứ tự hoặc giờ cụ thể.`
+                    : `Ngày này hiện chưa thấy giờ trống${draft.timeWindow?.label ? ` trong ${draft.timeWindow.label}` : ''} với bác sĩ đã chọn. Bạn có thể đổi ngày, đổi khung giờ hoặc đổi bác sĩ.`
             ].join('\n'),
             metadata: { intent: 'booking_collect_time', aiMode: 'local_booking', quickActions: baseActions },
             needsStaff: false,
@@ -1287,10 +1050,8 @@ const buildBookingResponse = async (message, { patientId, user }) => {
         };
     }
 
-    const connection = await pool.getConnection();
     try {
-        await connection.beginTransaction();
-        const { appointmentId } = await createAppointmentRecord(connection, {
+        const { appointmentId } = await createAppointmentFromChat({
             actor: user,
             patientId,
             dentistId: draft.dentistId,
@@ -1300,7 +1061,6 @@ const buildBookingResponse = async (message, { patientId, user }) => {
             serviceIds: draft.serviceIds,
             sourceNote: 'AI chatbox tạo lịch hẹn'
         });
-        await connection.commit();
         await clearConversationAssistantState(patientId);
 
         return {
@@ -1323,23 +1083,26 @@ const buildBookingResponse = async (message, { patientId, user }) => {
             priorityReason: ''
         };
     } catch (error) {
-        await connection.rollback();
         await saveConversationAssistantState(patientId, state);
         const slots = draft.dentistId && draft.appointmentDate
-            ? await findSlotsForDentistDate({ dentistId: draft.dentistId, date: draft.appointmentDate, serviceIds: draft.serviceIds, limit: 5 })
+            ? await findSlotsForDentistDate({
+                dentistId: draft.dentistId,
+                date: draft.appointmentDate,
+                serviceIds: draft.serviceIds,
+                limit: 5,
+                timeWindow: draft.timeWindow
+            })
             : [];
 
         return {
             message: [
-                `Mình chưa đặt được lịch vì: ${error.message}`,
+                `Mình chưa đặt được lịch vì: ${publicBookingError(error)}`,
                 slots.length ? `Bạn có thể chọn một giờ trống khác:\n${slots.map((slot, index) => `${index + 1}. ${slot.time}`).join('\n')}` : 'Bạn có thể đổi ngày, giờ hoặc bác sĩ để mình thử lại.'
             ].join('\n'),
             metadata: { intent: 'booking_failed', aiMode: 'local_booking', quickActions: baseActions },
             needsStaff: false,
             priorityReason: ''
         };
-    } finally {
-        connection.release();
     }
 };
 
@@ -1681,55 +1444,6 @@ const buildPatientOverviewText = ({ appointments, invoices, followUps }) => {
     return lines.join('\n');
 };
 
-const detectInvoiceScope = (text) => {
-    if (hasAny(text, ['da thanh toan', 'da tra tien', 'da thu tien', 'hoan tat thanh toan', 'thanh toan roi', 'da dong tien'])) {
-        return 'paid';
-    }
-
-    if (hasAny(text, ['tat ca hoa don', 'danh sach hoa don', 'cac hoa don', 'lich su hoa don', 'hoa don gan day'])) {
-        return 'all';
-    }
-
-    return 'open';
-};
-
-const detectAppointmentScope = (text) => {
-    if (hasAny(text, ['lich da huy', 'lich bi huy', 'lich huy', 'da huy'])) return 'cancelled';
-    if (hasAny(text, ['lich da kham', 'da kham', 'da hoan thanh', 'lich hoan thanh', 'kham xong'])) return 'completed';
-    if (hasAny(text, ['lich cu', 'lich qua khu', 'lich truoc day', 'lich da qua'])) return 'past';
-    if (hasAny(text, ['tat ca lich', 'tat ca cac lich', 'danh sach lich', 'cac lich kham', 'lich su lich hen', 'lich su dat lich', 'lich su kham'])) return 'all';
-    return 'upcoming';
-};
-
-const detectPersonalIntent = (text) => ({
-    appointment: hasAny(text, [
-        'lich cua toi',
-        'lich cua minh',
-        'lich hen cua toi',
-        'lich hen cua minh',
-        'lich kham cua toi',
-        'lich kham cua minh',
-        'cac lich kham cua toi',
-        'tat ca cac lich kham cua toi',
-        'tat ca lich kham',
-        'danh sach lich kham',
-        'lich sap toi',
-        'toi co lich',
-        'xem lich hen',
-        'kiem tra lich hen',
-        'kiem tra lich kham',
-        'lich hom nay',
-        'lich da kham',
-        'lich da huy',
-        'lich bi huy'
-    ]),
-    invoice: hasAny(text, ['hoa don cua toi', 'hoa don cua minh', 'hoa don chua thanh toan', 'xem hoa don', 'toi con no', 'can thanh toan', 'chua thanh toan', 'da thanh toan', 'da tra tien', 'da thu tien', 'lich su hoa don']),
-    record: hasAny(text, ['ho so kham', 'lich su kham', 'lan truoc toi kham gi', 'lan truoc kham gi', 'toi da kham gi', 'ket qua kham', 'chan doan cua toi', 'don thuoc cua toi', 'phac do dieu tri', 'bac si ghi gi']),
-    followUp: hasAny(text, ['tai kham', 'lich tai kham', 'ngay tai kham', 'khi nao tai kham', 'hen tai kham', 'co lich tai kham khong']),
-    overview: hasAny(text, ['tong quan cua toi', 'thong tin cua toi', 'tai khoan cua toi', 'toi co gi', 'kiem tra tai khoan']),
-    human: isHumanSupportIntent(text)
-});
-
 const buildReply = async (message) => {
     const intent = detectIntent(message);
     const settings = await getSettings();
@@ -1757,7 +1471,7 @@ const buildReply = async (message) => {
         lines.push('5. Sau điều trị, lễ tân hỗ trợ hóa đơn, thanh toán và lịch tái khám nếu có.');
         lines.push('');
         lines.push(buildLocationText(settings));
-    } else if (intent.isBooking || intent.isSlot || intent.isDoctor) {
+    } else if ((intent.isBooking || intent.isSlot || intent.isDoctor) && !intent.isOpening) {
         lines.push('Mình có thể gợi ý lịch dựa trên lịch làm việc của bác sĩ, ngày nghỉ riêng và các lịch đã được đặt.');
         await appendSuggestedSlots(lines, null, 5);
         lines.push('');
@@ -1787,13 +1501,27 @@ const buildReply = async (message) => {
     return lines.join('\n').trim();
 };
 
-const buildFocusedReply = async (message) => {
+const buildFocusedReply = async (message, preloadedKnowledgeResult = null) => {
     const intent = detectIntent(message);
     const settings = await getSettings();
-    const knowledge = await findKnowledgeMatch(message);
+    const knowledgeResult = preloadedKnowledgeResult || await findKnowledgeMatch(message);
+    const knowledge = knowledgeResult.bestMatch;
     const lines = [];
+    const groundingSources = [];
+    const addGroundingSource = (source) => {
+        if (!source?.id || groundingSources.some((item) => item.id === source.id && item.source === source.source)) return;
+        groundingSources.push(source);
+    };
 
     if (intent.isClinical) {
+        addGroundingSource(toSourceMetadata({
+            id: intent.topic.id,
+            source: 'builtin_topic',
+            title: intent.topic.label,
+            category: 'clinical',
+            score: intent.confidence,
+            matchedSignals: intent.matchedSignals
+        }));
         lines.push(intent.topic.answer);
         lines.push(intent.topic.booking);
         const asksAvailability = /(^|\s)(trong|gan nhat|it nguoi|luc nao|thoi diem|gio nao|bac si nao|slot)(\s|$)/.test(intent.text);
@@ -1812,15 +1540,19 @@ const buildFocusedReply = async (message) => {
             }
         }
     } else if (intent.isPayment) {
+        addGroundingSource({ id: 'payment_policy', source: 'system_rule', title: 'Thanh toán', category: 'payment', score: intent.confidence });
         lines.push('Bạn có thể thanh toán bằng tiền mặt, thẻ/chuyển khoản hoặc VNPay QR nếu hóa đơn hỗ trợ.');
         lines.push('Với VNPay QR, trạng thái hóa đơn sẽ đổi khi hệ thống nhận kết quả thanh toán thành công.');
     } else if (intent.isReschedule) {
+        addGroundingSource({ id: 'appointment_policy', source: 'system_rule', title: 'Đổi và hủy lịch', category: 'appointment', score: intent.confidence });
         lines.push('Bạn có thể đổi/hủy lịch trong phần Hồ sơ > Lịch hẹn nếu còn trong thời gian cho phép.');
         lines.push('Nếu cần đổi bác sĩ hoặc lịch đã xác nhận, lễ tân/admin sẽ kiểm tra và duyệt.');
     } else if (intent.isProfile) {
+        addGroundingSource({ id: 'medical_record_policy', source: 'system_rule', title: 'Hồ sơ khám', category: 'medical_record', score: intent.confidence });
         lines.push('Hồ sơ khám dùng để xem lịch sử khám, chẩn đoán, kế hoạch điều trị, tái khám và hóa đơn liên quan.');
         lines.push('Nếu vừa khám xong mà chưa thấy hồ sơ, bác sĩ có thể chưa hoàn tất ghi hồ sơ.');
     } else if (intent.isProcedure) {
+        addGroundingSource({ id: 'clinic_settings', source: 'settings', title: 'Thông tin phòng khám', category: 'clinic', score: intent.confidence });
         lines.push(`Quy trình khi đến ${settings.clinicName}:`);
         lines.push('1. Gặp lễ tân để check-in và xác nhận lịch.');
         lines.push('2. Chờ điều phối vào phòng khám theo bác sĩ phụ trách.');
@@ -1829,7 +1561,8 @@ const buildFocusedReply = async (message) => {
         lines.push(`Địa chỉ: ${settings.address}.`);
         if (settings.mapUrl) lines.push(`Bản đồ: ${settings.mapUrl}`);
         lines.push(`Hotline hỗ trợ: ${settings.phone}.`);
-    } else if (intent.isBooking || intent.isSlot || intent.isDoctor) {
+    } else if ((intent.isBooking || intent.isSlot || intent.isDoctor) && !intent.isOpening) {
+        addGroundingSource({ id: 'appointment_availability', source: 'database', title: 'Lịch làm việc và slot trống', category: 'appointment', score: intent.confidence });
         if (intent.isSlot || intent.isDoctor) {
             await appendSuggestedSlots(lines, null, 5);
             lines.push('Sau khi đặt online, lễ tân sẽ xác nhận lịch.');
@@ -1838,16 +1571,19 @@ const buildFocusedReply = async (message) => {
             lines.push('Sau khi lịch được xác nhận, hệ thống/lễ tân sẽ hướng dẫn thông tin đến khám.');
         }
     } else if (intent.isService) {
+        addGroundingSource({ id: 'active_services', source: 'database', title: 'Dịch vụ đang hoạt động', category: 'service', score: intent.confidence });
         lines.push('Dịch vụ đang hoạt động:');
         lines.push(buildServiceText(await getRelevantServices(null, intent.text)) || 'Chưa có dịch vụ phù hợp đang hiển thị.');
         lines.push('Giá có thể thay đổi theo tình trạng thực tế sau khi bác sĩ khám.');
     } else if (intent.isOpening) {
+        addGroundingSource({ id: 'clinic_settings', source: 'settings', title: 'Thông tin phòng khám', category: 'clinic', score: intent.confidence });
         lines.push(`${settings.clinicName} làm việc: ${settings.openingHours}.`);
         lines.push(`Hotline: ${settings.phone}.`);
     } else if (intent.isGreeting) {
         lines.push(`Chào bạn, mình là ${ASSISTANT_NAME}.`);
         lines.push('Bạn cần tư vấn dịch vụ, xem lịch trống hay kiểm tra lịch/hóa đơn của mình?');
     } else if (knowledge) {
+        knowledgeResult.sources.forEach(addGroundingSource);
         lines.push(knowledge.answer);
         if (knowledge.id === 'booking_flow') {
             lines.push('Bạn nhắn giúp mình dịch vụ/triệu chứng muốn khám trước nhé.');
@@ -1861,30 +1597,117 @@ const buildFocusedReply = async (message) => {
         lines.push('Thông tin này chỉ mang tính định hướng; chẩn đoán chính thức cần bác sĩ thăm khám.');
     }
 
-    return lines.join('\n').trim();
+    return {
+        text: lines.join('\n').trim(),
+        groundingSources,
+        groundingConfidence: groundingSources.length
+            ? Math.max(...groundingSources.map((source) => Number(source.score || 0)))
+            : 0,
+        resolvedIntent: knowledge && !intent.isClinical && intent.primaryIntent === 'general'
+            ? `knowledge_${knowledge.category || 'general'}`
+            : intent.primaryIntent
+    };
 };
 
 const buildAssistantResponse = async (message, context = {}) => {
-    const text = normalizeText(message);
-    const intent = detectIntent(message);
+    const patientId = Number(context.patientId || context.user?.id || 0);
+    let effectiveMessage = message;
+    let dialogueState = patientId > 0 ? await getConversationAssistantState(patientId) : null;
+
+    if (dialogueState?.mode === 'intent_clarification') {
+        const resolved = resolveIntentClarification(dialogueState, message);
+        if (resolved) {
+            effectiveMessage = resolved.canonicalMessage;
+            await clearConversationAssistantState(patientId);
+            dialogueState = null;
+        } else {
+            return {
+                message: [
+                    'Mình chưa xác định được lựa chọn của bạn. Bạn chọn một mục bằng số hoặc tên nhé:',
+                    ...(dialogueState.options || []).map((option, index) => `${index + 1}. ${option.label}`)
+                ].join('\n'),
+                metadata: attachQualityTelemetry({
+                    intent: 'intent_clarification',
+                    confidence: 0.2,
+                    detectedIntents: [],
+                    expectedEntity: 'intent',
+                    groundingSources: [],
+                    groundingConfidence: 0,
+                    grounded: false,
+                    aiMode: 'local',
+                    quickActions: (dialogueState.options || []).slice(0, 4).map((option) => action(option.label, 'message', option.label))
+                }),
+                needsStaff: false,
+                priorityReason: ''
+            };
+        }
+    }
+
+    const text = normalizeText(effectiveMessage);
+    const intent = detectIntent(effectiveMessage);
     const personalIntent = detectPersonalIntent(text);
     const appointmentScope = detectAppointmentScope(text);
     const invoiceScope = detectInvoiceScope(text);
     const settings = await getSettings();
-    const patientId = Number(context.patientId || context.user?.id || 0);
     const quickActions = commonActions(settings);
     let responseText = '';
     let needsStaff = false;
     let priorityReason = '';
+    let groundingSources = [];
+    let groundingConfidence = 0;
+    let resolvedIntent = '';
     const hasPersonalDataIntent = personalIntent.overview
         || personalIntent.followUp
         || personalIntent.record
         || personalIntent.appointment
         || personalIntent.invoice;
+    const preloadedKnowledgeResult = intent.primaryIntent === 'general' && !hasPersonalDataIntent
+        ? await findKnowledgeMatch(effectiveMessage)
+        : null;
+
+    if (shouldClarifyIntent(intent, {
+        isInBookingFlow: dialogueState?.mode === 'booking',
+        hasPersonalDataIntent
+    }) && !preloadedKnowledgeResult?.bestMatch && patientId > 0) {
+        const clarificationState = createIntentClarificationState(effectiveMessage);
+        await saveConversationAssistantState(patientId, clarificationState);
+        return {
+            message: [
+                'Mình chưa chắc bạn đang muốn thực hiện việc nào. Bạn chọn giúp mình nhé:',
+                ...clarificationState.options.map((option, index) => `${index + 1}. ${option.label}`)
+            ].join('\n'),
+            metadata: attachQualityTelemetry({
+                intent: 'intent_clarification',
+                confidence: intent.confidence,
+                detectedIntents: intent.detectedIntents,
+                matchedSignals: intent.matchedSignals,
+                expectedEntity: 'intent',
+                groundingSources: [],
+                groundingConfidence: 0,
+                grounded: false,
+                aiMode: 'local',
+                quickActions: clarificationState.options.slice(0, 4).map((option) => action(option.label, 'message', option.label))
+            }),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
 
     if (!hasPersonalDataIntent) {
-        const bookingResponse = await buildBookingResponse(message, { patientId, user: context.user || { id: patientId, role: 'patient' } });
+        const bookingResponse = await buildBookingResponse(effectiveMessage, { patientId, user: context.user || { id: patientId, role: 'patient' } });
         if (bookingResponse) {
+            bookingResponse.metadata = attachQualityTelemetry({
+                ...bookingResponse.metadata,
+                groundingSources: [{
+                    id: 'appointment_booking_flow',
+                    source: 'database_system',
+                    title: 'Quy trình, dịch vụ, bác sĩ và slot đặt lịch',
+                    category: 'appointment',
+                    score: 1
+                }],
+                groundingConfidence: 1,
+                grounded: true
+            });
             return bookingResponse;
         }
     }
@@ -1896,26 +1719,44 @@ const buildAssistantResponse = async (message, context = {}) => {
             getPatientFollowUps(patientId)
         ]);
         responseText = buildPatientOverviewText({ appointments, invoices, followUps });
+        groundingSources = [{ id: 'patient_overview', source: 'database', title: 'Dữ liệu tổng quan của khách hàng', category: 'personal', score: 1 }];
+        groundingConfidence = 1;
         quickActions.unshift(action('Mở hồ sơ', 'route', '/profile'));
-    } else if (personalIntent.followUp && patientId > 0) {
-        const followUps = await getPatientFollowUps(patientId);
-        responseText = buildPatientFollowUpText(followUps);
-        quickActions.unshift(action('Đặt tái khám', 'route', '/booking'));
-        quickActions.unshift(action('Mở hồ sơ khám', 'route', '/profile?tab=history'));
-    } else if (personalIntent.record && patientId > 0) {
-        const records = await getPatientMedicalRecords(patientId);
-        responseText = buildPatientMedicalRecordText(records);
-        quickActions.unshift(action('Mở hồ sơ khám', 'route', '/profile?tab=history'));
-    } else if (personalIntent.appointment && patientId > 0) {
-        const appointments = await getPatientAppointments(patientId, appointmentScope);
-        responseText = buildPatientAppointmentTextByScope(appointments, appointmentScope);
-        quickActions.unshift(action('Mở lịch hẹn', 'route', '/profile?tab=appointments'));
-    } else if (personalIntent.invoice && patientId > 0) {
-        const invoices = await getPatientInvoices(patientId, invoiceScope);
-        responseText = buildPatientInvoiceTextByScope(invoices, invoiceScope);
-        quickActions.unshift(action('Mở hóa đơn', 'route', '/profile?tab=invoices'));
+    } else if (hasPersonalDataIntent && patientId > 0) {
+        const sections = [];
+        if (personalIntent.followUp) {
+            const followUps = await getPatientFollowUps(patientId);
+            sections.push(buildPatientFollowUpText(followUps));
+            quickActions.unshift(action('Đặt tái khám', 'route', '/book-appointment'));
+            quickActions.unshift(action('Mở hồ sơ khám', 'route', '/profile?tab=history'));
+        }
+        if (personalIntent.record) {
+            const records = await getPatientMedicalRecords(patientId);
+            sections.push(buildPatientMedicalRecordText(records));
+            quickActions.unshift(action('Mở hồ sơ khám', 'route', '/profile?tab=history'));
+        }
+        if (personalIntent.appointment) {
+            const appointments = await getPatientAppointments(patientId, appointmentScope);
+            sections.push(buildPatientAppointmentTextByScope(appointments, appointmentScope));
+            quickActions.unshift(action('Mở lịch hẹn', 'route', '/profile?tab=appointments'));
+        }
+        if (personalIntent.invoice) {
+            const invoices = await getPatientInvoices(patientId, invoiceScope);
+            sections.push(buildPatientInvoiceTextByScope(invoices, invoiceScope));
+            quickActions.unshift(action('Mở hóa đơn', 'route', '/profile?tab=invoices'));
+        }
+        responseText = sections.join('\n\n');
+        if (personalIntent.followUp) groundingSources.push({ id: 'patient_followups', source: 'database', title: 'Lịch tái khám', category: 'personal', score: 1 });
+        if (personalIntent.record) groundingSources.push({ id: 'patient_records', source: 'database', title: 'Hồ sơ khám', category: 'personal', score: 1 });
+        if (personalIntent.appointment) groundingSources.push({ id: 'patient_appointments', source: 'database', title: 'Lịch hẹn của khách hàng', category: 'personal', score: 1 });
+        if (personalIntent.invoice) groundingSources.push({ id: 'patient_invoices', source: 'database', title: 'Hóa đơn của khách hàng', category: 'personal', score: 1 });
+        groundingConfidence = groundingSources.length ? 1 : 0;
     } else {
-        responseText = await buildFocusedReply(message);
+        const focusedReply = await buildFocusedReply(effectiveMessage, preloadedKnowledgeResult);
+        responseText = focusedReply.text;
+        groundingSources = focusedReply.groundingSources;
+        groundingConfidence = focusedReply.groundingConfidence;
+        resolvedIntent = focusedReply.resolvedIntent;
     }
 
     if (personalIntent.human) {
@@ -1940,13 +1781,20 @@ const buildAssistantResponse = async (message, context = {}) => {
                     : personalIntent.appointment ? 'patient_appointments'
                         : personalIntent.invoice ? 'patient_invoices'
                             : personalIntent.human ? 'human_support'
-                                : intent.topic?.id || 'general',
+                                : resolvedIntent || intent.primaryIntent || intent.topic?.id || 'general',
         needsStaff,
         priorityReason,
+        confidence: intent.confidence,
+        detectedIntents: intent.detectedIntents,
+        matchedSignals: intent.matchedSignals,
+        entities: intent.entities,
+        groundingSources,
+        groundingConfidence,
+        grounded: groundingSources.length > 0,
         quickActions: quickActions.slice(0, 4),
         aiMode: getAiConfig().enabled ? 'external' : 'local'
     };
-    metadata.needsTrainingReview = metadata.intent === 'general' && !intent.isGreeting && !personalIntent.human;
+    metadata.needsTrainingReview = metadata.intent === 'general' && !metadata.grounded && !intent.isGreeting && !personalIntent.human;
     metadata.trainingReason = metadata.needsTrainingReview
         ? 'AI chưa xác định được intent rõ ràng hoặc chưa có tri thức phù hợp.'
         : '';
@@ -1960,8 +1808,8 @@ const buildAssistantResponse = async (message, context = {}) => {
             'patient_invoices'
         ].includes(metadata.intent);
 
-        const aiReply = isPersonalDataReply ? null : await generateAiReply({
-            userMessage: message,
+        const aiReply = isPersonalDataReply || !metadata.grounded ? null : await generateAiReply({
+            userMessage: effectiveMessage,
             draftReply: responseText,
             settings,
             metadata
@@ -1978,7 +1826,7 @@ const buildAssistantResponse = async (message, context = {}) => {
 
     return {
         message: responseText,
-        metadata,
+        metadata: attachQualityTelemetry(metadata),
         needsStaff,
         priorityReason
     };

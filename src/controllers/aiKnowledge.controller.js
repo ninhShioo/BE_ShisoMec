@@ -1,4 +1,6 @@
 const pool = require('../config/database');
+const { summarizeAiQuality } = require('../services/aiQuality.service');
+const { buildKnowledgeQaReport } = require('../services/aiKnowledgeQa.service');
 
 const parseKeywords = (keywords) => {
     if (Array.isArray(keywords)) {
@@ -20,7 +22,54 @@ const validatePayload = ({ title, answer, keywords }) => {
     return null;
 };
 
+const evaluateCandidate = async (candidate, excludeId = null) => {
+    const params = [];
+    let query = `SELECT id, title, category, keywords, answer, updatedAt
+                 FROM AiKnowledge
+                 WHERE isActive = 1`;
+    if (Number.isInteger(Number(excludeId)) && Number(excludeId) > 0) {
+        query += ' AND id <> ?';
+        params.push(Number(excludeId));
+    }
+    query += ' ORDER BY updatedAt DESC LIMIT 200';
+
+    const [existingItems] = await pool.query(query, params);
+    return buildKnowledgeQaReport({
+        candidate,
+        existingItems,
+        testQuestions: Array.isArray(candidate.testQuestions) ? candidate.testQuestions : []
+    });
+};
+
+const rejectUnsafeCandidate = (res, qa) => {
+    if (qa.ready) return false;
+    res.status(400).json({
+        success: false,
+        message: 'Tri thức chưa đạt kiểm tra chất lượng.',
+        data: { qa }
+    });
+    return true;
+};
+
 const aiKnowledgeController = {
+    validateCandidate: async (req, res, next) => {
+        try {
+            const validationError = validatePayload(req.body);
+            if (validationError) {
+                return res.status(400).json({ success: false, message: validationError });
+            }
+
+            const qa = await evaluateCandidate(req.body, req.body.id);
+            res.json({
+                success: true,
+                message: qa.ready ? 'Tri thức đạt kiểm tra chất lượng.' : 'Tri thức cần chỉnh sửa trước khi sử dụng.',
+                data: qa
+            });
+        } catch (error) {
+            next(error);
+        }
+    },
+
     getTrainingSamples: async (req, res, next) => {
         try {
             const { status = 'pending', q = '' } = req.query;
@@ -71,14 +120,27 @@ const aiKnowledgeController = {
 
     getFeedbackSummary: async (req, res, next) => {
         try {
-            const [[summary]] = await pool.query(`
-                SELECT
-                    COUNT(*) as total,
-                    SUM(CASE WHEN rating = "helpful" THEN 1 ELSE 0 END) as helpful,
-                    SUM(CASE WHEN rating = "unhelpful" THEN 1 ELSE 0 END) as unhelpful
-                FROM AiFeedback
-                WHERE createdAt >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-            `);
+            const requestedDays = Number(req.query.days || 30);
+            const days = Number.isInteger(requestedDays) && requestedDays >= 1 && requestedDays <= 365 ? requestedDays : 30;
+            const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+            const [messages] = await pool.query(
+                `SELECT id, metadata, createdAt
+                 FROM ChatMessages
+                 WHERE isAssistant = 1 AND createdAt >= ?
+                 ORDER BY createdAt DESC
+                 LIMIT 5000`,
+                [since]
+            );
+            const [feedback] = await pool.query(
+                `SELECT messageId, rating, createdAt
+                 FROM AiFeedback
+                 WHERE createdAt >= ?
+                 ORDER BY createdAt DESC
+                 LIMIT 5000`,
+                [since]
+            );
+            const quality = summarizeAiQuality({ messages, feedback, days });
 
             const [recentUnhelpful] = await pool.query(`
                 SELECT
@@ -101,9 +163,10 @@ const aiKnowledgeController = {
                 success: true,
                 message: 'Lấy thống kê phản hồi AI thành công.',
                 data: {
-                    total: Number(summary.total || 0),
-                    helpful: Number(summary.helpful || 0),
-                    unhelpful: Number(summary.unhelpful || 0),
+                    total: quality.totalFeedback,
+                    helpful: quality.helpful,
+                    unhelpful: quality.unhelpful,
+                    quality,
                     recentUnhelpful
                 }
             });
@@ -150,6 +213,8 @@ const aiKnowledgeController = {
             if (validationError) {
                 return res.status(400).json({ success: false, message: validationError });
             }
+            const qa = await evaluateCandidate(req.body);
+            if (rejectUnsafeCandidate(res, qa)) return;
 
             const [result] = await pool.query(
                 `INSERT INTO AiKnowledge (title, category, keywords, answer, isActive)
@@ -219,6 +284,9 @@ const aiKnowledgeController = {
                 return res.status(400).json({ success: false, message: validationError });
             }
 
+            const qa = await evaluateCandidate(req.body);
+            if (rejectUnsafeCandidate(res, qa)) return;
+
             await connection.beginTransaction();
 
             const [samples] = await connection.query('SELECT id FROM AiTrainingSamples WHERE id = ? FOR UPDATE', [id]);
@@ -274,6 +342,8 @@ const aiKnowledgeController = {
             if (validationError) {
                 return res.status(400).json({ success: false, message: validationError });
             }
+            const qa = await evaluateCandidate(req.body, id);
+            if (rejectUnsafeCandidate(res, qa)) return;
 
             const [result] = await pool.query(
                 `UPDATE AiKnowledge
