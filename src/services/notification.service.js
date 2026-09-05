@@ -1,5 +1,5 @@
 const pool = require('../config/database');
-const { emitToUser, emitToRoles } = require('../socket/emitter');
+const { emitToUser } = require('../socket/emitter');
 
 const shouldSendNotification = async (db, userId, type) => {
     const key = ['appointment', 'payment', 'chat'].includes(type) ? type : 'systemNotice';
@@ -48,7 +48,6 @@ const createNotificationsForRoles = async (connectionOrPool, roles, title, messa
         await createNotification(db, user.id, title, message, type);
     }
 
-    emitToRoles(roles, 'notification:role', { title, message, type, createdAt: new Date() });
     return users.length;
 };
 

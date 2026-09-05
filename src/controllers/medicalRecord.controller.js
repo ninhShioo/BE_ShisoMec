@@ -1,5 +1,5 @@
 const pool = require('../config/database');
-const { createNotification } = require('../services/notification.service');
+const { createNotification, createNotificationsForRoles } = require('../services/notification.service');
 
 const parseAttachments = (attachments) => {
     if (!attachments) return null;
@@ -303,7 +303,7 @@ const medicalRecordController = {
 
             await connection.query(
                 'UPDATE Appointments SET status = "completed", completedAt = NOW(), statusChangedAt = NOW(), statusNote = ? WHERE id = ?',
-                ['Hoàn thành sau khi lưu hồ sơ khám', appointmentId]
+                ['Khám xong sau khi lưu hồ sơ khám', appointmentId]
             );
             await recordAppointmentStatusHistory(
                 connection,
@@ -319,8 +319,16 @@ const medicalRecordController = {
                 connection,
                 appointment.patientId,
                 'Hồ sơ khám đã được cập nhật',
-                `Bác sĩ đã hoàn tất hồ sơ khám cho lịch hẹn #${appointmentId}.`,
+                `Bác sĩ đã lưu hồ sơ khám cho lịch hẹn #${appointmentId}.`,
                 'appointment'
+            );
+
+            await createNotificationsForRoles(
+                connection,
+                ['staff', 'admin'],
+                'Khám xong, cần lập hóa đơn',
+                `Bác sĩ đã khám xong và lưu hồ sơ cho lịch hẹn #${appointmentId}. Vui lòng kiểm tra để lập hóa đơn và thu tiền.`,
+                'payment'
             );
 
             await connection.commit();

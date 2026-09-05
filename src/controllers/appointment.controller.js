@@ -10,7 +10,7 @@ const statusLabels = {
     confirmed: 'Đã xác nhận',
     arrived: 'Khách đã đến',
     in_progress: 'Đang khám',
-    completed: 'Hoàn thành',
+    completed: 'Khám xong',
     cancelled: 'Đã hủy',
     no_show: 'Không đến'
 };
@@ -40,6 +40,30 @@ const formatDateTimeForMessage = (appointment) => {
     const date = normalizeDateValue(appointment.appointmentDate);
     const time = String(appointment.appointmentTime || '').slice(0, 5);
     return `${time} ngày ${date.split('-').reverse().join('/')}`;
+};
+
+const getUserNameById = async (connection, userId) => {
+    if (!userId) return '';
+    const [[user]] = await connection.query(
+        'SELECT fullName FROM Users WHERE id = ? LIMIT 1',
+        [userId]
+    );
+    return user?.fullName || '';
+};
+
+const describeDentistChange = (oldDentistName, newDentistName) => {
+    const oldName = oldDentistName || 'Chưa phân công';
+    const newName = newDentistName || 'Chưa phân công';
+    return `${oldName} -> ${newName}`;
+};
+
+const buildPatientDentistChangeMessage = (appointmentId, oldDentistName, newDentistName, appointmentDate, appointmentTime) => {
+    const dateText = normalizeDateValue(appointmentDate);
+    const timeText = String(appointmentTime || '').slice(0, 5);
+    const scheduleText = dateText && timeText ? ` Lịch khám vẫn giữ vào ${dateText} lúc ${timeText}.` : '';
+    const oldText = oldDentistName || 'chưa phân công';
+    const newText = newDentistName || 'bác sĩ mới';
+    return `Lịch hẹn #${appointmentId} đã được cập nhật bác sĩ phụ trách từ ${oldText} sang ${newText}.${scheduleText}`;
 };
 
 const findReleasedSlotCandidates = async (connection, releasedAppointment) => {
@@ -528,14 +552,16 @@ const createAppointmentRecord = async (connection, {
         throw new Error('Bệnh nhân không tồn tại hoặc đang bị khóa.');
     }
 
+    let preferredDentistName = '';
     if (dentistId) {
         const [dentists] = await connection.query(
-            'SELECT id FROM Users WHERE id = ? AND role = "dentist" AND status = "active"',
+            'SELECT id, fullName FROM Users WHERE id = ? AND role = "dentist" AND status = "active"',
             [dentistId]
         );
         if (dentists.length === 0) {
             throw new Error('Bác sĩ không tồn tại hoặc đang bị khóa.');
         }
+        preferredDentistName = dentists[0].fullName || '';
     }
 
     const [validServices] = await connection.query(
@@ -568,8 +594,8 @@ const createAppointmentRecord = async (connection, {
     }
 
     const [apptResult] = await connection.query(
-        'INSERT INTO Appointments (patientId, dentistId, appointmentDate, appointmentTime, notes) VALUES (?, ?, ?, ?, ?)',
-        [patientId, dentistId || null, appointmentDate, appointmentTime, notes || null]
+        'INSERT INTO Appointments (patientId, preferredDentistId, dentistId, appointmentDate, appointmentTime, notes) VALUES (?, ?, ?, ?, ?, ?)',
+        [patientId, dentistId || null, dentistId || null, appointmentDate, appointmentTime, notes || null]
     );
     const appointmentId = apptResult.insertId;
     await recordAppointmentStatusHistory(connection, appointmentId, null, 'pending', actor?.id, null, sourceNote);
@@ -586,12 +612,28 @@ const createAppointmentRecord = async (connection, {
             connection,
             ['admin', 'staff'],
             'Lịch hẹn mới',
-            `Có lịch hẹn #${appointmentId} mới cần kiểm tra và xác nhận.`,
+            `Có lịch hẹn #${appointmentId} mới cần kiểm tra và xác nhận.${preferredDentistName ? ` Khách chọn bác sĩ dự kiến: ${preferredDentistName}.` : ''}`,
             'appointment'
         );
     }
 
-    return { appointmentId, patientId, policySettings };
+    if (dentistId) {
+        await createNotification(
+            connection,
+            Number(dentistId),
+            'Khách chọn bác sĩ dự kiến',
+            `Lịch hẹn #${appointmentId} có chọn bạn làm bác sĩ dự kiến. Lễ tân sẽ xác nhận hoặc điều phối lại nếu lịch phát sinh bận đột xuất.`,
+            'appointment'
+        );
+    }
+
+    return {
+        appointmentId,
+        patientId,
+        policySettings,
+        preferredDentistId: dentistId || null,
+        preferredDentistName
+    };
 };
 
 const appointmentController = {
@@ -691,7 +733,7 @@ const appointmentController = {
             await connection.beginTransaction();
 
             const { dentistId, appointmentDate, appointmentTime, notes, serviceIds } = req.body;
-            const { appointmentId } = await createAppointmentRecord(connection, {
+            const { appointmentId, preferredDentistName } = await createAppointmentRecord(connection, {
                 actor: req.user,
                 patientId: req.body.patientId,
                 dentistId,
@@ -706,8 +748,16 @@ const appointmentController = {
 
             res.status(201).json({
                 success: true,
-                message: 'Đặt lịch hẹn thành công.',
-                data: { appointmentId }
+                message: preferredDentistName
+                    ? `Đặt lịch hẹn thành công. Bác sĩ ${preferredDentistName} là lựa chọn dự kiến; lễ tân sẽ xác nhận hoặc điều phối lại nếu bác sĩ bận đột xuất.`
+                    : 'Đặt lịch hẹn thành công.',
+                data: {
+                    appointmentId,
+                    preferredDentistName,
+                    doctorSelectionNotice: preferredDentistName
+                        ? 'Bác sĩ khách chọn chỉ là dự kiến cho đến khi phòng khám xác nhận lịch.'
+                        : ''
+                }
             });
         } catch (error) {
             await connection.rollback();
@@ -735,11 +785,12 @@ const appointmentController = {
 
             let query = `
                 SELECT 
-                    a.id, a.patientId, a.dentistId, a.appointmentDate, a.appointmentTime, a.status, a.notes,
+                    a.id, a.patientId, a.preferredDentistId, a.dentistId, a.appointmentDate, a.appointmentTime, a.status, a.notes,
                     a.confirmationReminderSentAt, a.statusChangedAt, a.checkedInAt, a.startedAt, a.completedAt,
                     a.cancelledAt, a.noShowAt, a.cancellationReason, a.statusNote, a.rescheduledAt, a.rescheduleReason,
                     a.createdAt,
                     p.fullName as patientName, p.phone as patientPhone,
+                    pd.fullName as preferredDentistName,
                     d.fullName as dentistName,
                     svc.serviceIds,
                     svc.serviceNames,
@@ -748,6 +799,7 @@ const appointmentController = {
                     inv.totalAmount as invoiceTotalAmount
                 FROM Appointments a
                 JOIN Users p ON a.patientId = p.id
+                LEFT JOIN Users pd ON a.preferredDentistId = pd.id
                 LEFT JOIN Users d ON a.dentistId = d.id
                 LEFT JOIN (
                     SELECT 
@@ -1011,6 +1063,16 @@ const appointmentController = {
                 );
             }
 
+            if (status === 'confirmed' && appt.dentistId) {
+                await createNotification(
+                    connection,
+                    appt.dentistId,
+                    'Lịch hẹn đã được xác nhận',
+                    `Lịch hẹn #${id} đã được xác nhận và đang phân công cho bạn phụ trách.`,
+                    'appointment'
+                );
+            }
+
             if (status === 'arrived' && appt.dentistId) {
                 await createNotification(
                     connection,
@@ -1018,6 +1080,16 @@ const appointmentController = {
                     'Khách hàng đã đến phòng khám',
                     `Khách hàng của lịch hẹn #${id} đã được lễ tân check-in.`,
                     'appointment'
+                );
+            }
+
+            if (status === 'completed') {
+                await createNotificationsForRoles(
+                    connection,
+                    ['staff', 'admin'],
+                    'Khám xong, cần lập hóa đơn',
+                    `Lịch hẹn #${id} đã khám xong. Vui lòng kiểm tra để lập hóa đơn và thu tiền.`,
+                    'payment'
                 );
             }
 
@@ -1031,6 +1103,16 @@ const appointmentController = {
                 );
 
                 releasedSlotEmailJobs = await notifyReleasedSlotCandidates(connection, appt);
+            }
+
+            if (status === 'cancelled' && req.user.role === 'patient') {
+                await createNotificationsForRoles(
+                    connection,
+                    ['admin', 'staff'],
+                    'Khách hàng đã hủy lịch',
+                    `Khách hàng đã hủy lịch hẹn #${id}${reason ? `: ${reason}` : '.'}`,
+                    'appointment'
+                );
             }
 
             await connection.commit();
@@ -1060,14 +1142,14 @@ const appointmentController = {
     assignDentist: async (req, res, next) => {
         try {
             const { id } = req.params;
-            const { dentistId } = req.body;
+            const { dentistId, note } = req.body;
 
             if (!dentistId) {
                 return res.status(400).json({ success: false, message: 'Vui lòng cung cấp dentistId.' });
             }
 
             const [dentist] = await pool.query(
-                'SELECT id FROM Users WHERE id = ? AND role = "dentist" AND status = "active"',
+                'SELECT id, fullName FROM Users WHERE id = ? AND role = "dentist" AND status = "active"',
                 [dentistId]
             );
             if (dentist.length === 0) {
@@ -1075,7 +1157,7 @@ const appointmentController = {
             }
 
             const [existing] = await pool.query(
-                'SELECT id, patientId, dentistId, appointmentDate, appointmentTime, status FROM Appointments WHERE id = ?',
+                'SELECT id, patientId, preferredDentistId, dentistId, appointmentDate, appointmentTime, status FROM Appointments WHERE id = ?',
                 [id]
             );
             if (existing.length === 0) {
@@ -1083,6 +1165,13 @@ const appointmentController = {
             }
 
             const appt = existing[0];
+            if (Number(appt.dentistId || 0) === Number(dentistId)) {
+                return res.json({
+                    success: true,
+                    message: 'Bác sĩ này đang là bác sĩ phụ trách của lịch hẹn.'
+                });
+            }
+
             if (!['pending', 'confirmed'].includes(appt.status)) {
                 return res.status(400).json({
                     success: false,
@@ -1091,6 +1180,11 @@ const appointmentController = {
             }
 
             if (req.user.role === 'staff' && appt.status === 'confirmed') {
+                const requestNote = String(note || '').trim();
+                if (!requestNote) {
+                    return res.status(400).json({ success: false, message: 'Vui lòng nhập lý do đổi bác sĩ để admin duyệt.' });
+                }
+
                 const [pendingRequests] = await pool.query(
                     'SELECT id FROM DentistChangeRequests WHERE appointmentId = ? AND status = "pending" LIMIT 1',
                     [id]
@@ -1102,14 +1196,17 @@ const appointmentController = {
                 const [requestResult] = await pool.query(
                     `INSERT INTO DentistChangeRequests (appointmentId, requestedBy, oldDentistId, newDentistId, note)
                      VALUES (?, ?, ?, ?, ?)`,
-                    [id, req.user.id, appt.dentistId || null, dentistId, req.body.note || null]
+                    [id, req.user.id, appt.dentistId || null, dentistId, requestNote]
                 );
+
+                const oldDentistName = await getUserNameById(pool, appt.dentistId);
+                const changeText = describeDentistChange(oldDentistName, dentist[0].fullName);
 
                 await createNotificationsForRoles(
                     pool,
                     ['admin'],
                     'Yêu cầu đổi bác sĩ',
-                    `Lễ tân yêu cầu đổi bác sĩ cho lịch hẹn #${id}.`,
+                    `Lễ tân yêu cầu đổi bác sĩ cho lịch hẹn #${id}: ${changeText}. Lý do: ${requestNote}`,
                     'appointment'
                 );
 
@@ -1141,19 +1238,60 @@ const appointmentController = {
                 });
             }
 
+            const oldDentistName = await getUserNameById(pool, appt.dentistId);
+            const newDentistName = dentist[0].fullName;
+            const changeText = describeDentistChange(oldDentistName, newDentistName);
+
             await pool.query('UPDATE Appointments SET dentistId = ? WHERE id = ?', [dentistId, id]);
+            await recordAppointmentStatusHistory(
+                pool,
+                id,
+                appt.status,
+                appt.status,
+                req.user.id,
+                'Đổi bác sĩ phụ trách',
+                `Bác sĩ phụ trách: ${changeText}.${note ? ` Lý do: ${note}` : ''}`
+            );
 
             await createNotification(
                 pool,
                 appt.patientId,
                 'Bác sĩ phụ trách đã được cập nhật',
-                `Lịch hẹn #${id} đã được phân công bác sĩ phụ trách.`,
+                `${buildPatientDentistChangeMessage(id, oldDentistName, newDentistName, appt.appointmentDate, appt.appointmentTime)} Đây là điều phối chính thức hiện tại của phòng khám.`,
+                'appointment'
+            );
+
+            await createNotification(
+                pool,
+                Number(dentistId),
+                'Bạn được phân công lịch hẹn',
+                `Bạn được phân công phụ trách lịch hẹn #${id} vào ${normalizeDateValue(appt.appointmentDate)} ${String(appt.appointmentTime).slice(0, 5)}.`,
+                'appointment'
+            );
+
+            if (appt.dentistId && Number(appt.dentistId) !== Number(dentistId)) {
+                await createNotification(
+                    pool,
+                    appt.dentistId,
+                    'Lịch hẹn đã đổi bác sĩ phụ trách',
+                    `Lịch hẹn #${id} đã được điều phối sang ${newDentistName}.${note ? ` Lý do: ${note}` : ''}`,
+                    'appointment'
+                );
+            }
+
+            await createNotificationsForRoles(
+                pool,
+                ['staff'],
+                'Cập nhật bác sĩ phụ trách',
+                `Lịch hẹn #${id} đã đổi bác sĩ: ${changeText}.`,
                 'appointment'
             );
 
             res.json({
                 success: true,
-                message: 'Đã phân công bác sĩ thành công.'
+                message: appt.status === 'pending'
+                    ? 'Đã cập nhật bác sĩ dự kiến/phụ trách cho lịch đang chờ xác nhận.'
+                    : 'Đã đổi bác sĩ phụ trách thành công.'
             });
         } catch (error) {
             next(error);
@@ -1345,9 +1483,13 @@ const appointmentController = {
             await connection.beginTransaction();
 
             const [requests] = await connection.query(
-                `SELECT r.*, a.patientId, a.appointmentDate, a.appointmentTime, a.status as appointmentStatus
+                `SELECT r.*, a.patientId, a.appointmentDate, a.appointmentTime, a.status as appointmentStatus,
+                        oldDentist.fullName as oldDentistName,
+                        newDentist.fullName as newDentistName
                  FROM DentistChangeRequests r
                  JOIN Appointments a ON a.id = r.appointmentId
+                 LEFT JOIN Users oldDentist ON oldDentist.id = r.oldDentistId
+                 JOIN Users newDentist ON newDentist.id = r.newDentistId
                  WHERE r.id = ?
                  FOR UPDATE`,
                 [requestId]
@@ -1393,6 +1535,15 @@ const appointmentController = {
                     'UPDATE Appointments SET dentistId = ? WHERE id = ?',
                     [request.newDentistId, request.appointmentId]
                 );
+                await recordAppointmentStatusHistory(
+                    connection,
+                    request.appointmentId,
+                    request.appointmentStatus,
+                    request.appointmentStatus,
+                    req.user.id,
+                    'Duyệt đổi bác sĩ phụ trách',
+                    `Bác sĩ phụ trách: ${describeDentistChange(request.oldDentistName, request.newDentistName)}.${request.note ? ` Lý do: ${request.note}` : ''}`
+                );
             }
 
             await connection.query(
@@ -1413,10 +1564,36 @@ const appointmentController = {
                     connection,
                     request.patientId,
                     'Bác sĩ phụ trách đã được cập nhật',
-                    `Lịch hẹn #${request.appointmentId} đã được đổi bác sĩ phụ trách.`,
+                    `${buildPatientDentistChangeMessage(request.appointmentId, request.oldDentistName, request.newDentistName, request.appointmentDate, request.appointmentTime)} Đây là điều phối chính thức hiện tại của phòng khám.`,
                     'appointment'
                 );
+
+                await createNotification(
+                    connection,
+                    request.newDentistId,
+                    'Bạn được phân công lịch hẹn',
+                    `Bạn được phân công phụ trách lịch hẹn #${request.appointmentId} vào ${normalizeDateValue(request.appointmentDate)} ${String(request.appointmentTime).slice(0, 5)}.`,
+                    'appointment'
+                );
+
+                if (request.oldDentistId) {
+                    await createNotification(
+                        connection,
+                        request.oldDentistId,
+                        'Lịch hẹn đã đổi bác sĩ phụ trách',
+                        `Lịch hẹn #${request.appointmentId} đã được điều phối sang ${request.newDentistName}.${request.note ? ` Lý do: ${request.note}` : ''}`,
+                        'appointment'
+                    );
+                }
             }
+
+            await createNotificationsForRoles(
+                connection,
+                ['staff'],
+                status === 'approved' ? 'Admin đã duyệt đổi bác sĩ' : 'Admin từ chối đổi bác sĩ',
+                `Yêu cầu đổi bác sĩ cho lịch hẹn #${request.appointmentId} đã được ${status === 'approved' ? 'duyệt' : 'từ chối'}.`,
+                'appointment'
+            );
 
             await connection.commit();
             res.json({ success: true, message: 'Đã xử lý yêu cầu đổi bác sĩ.' });

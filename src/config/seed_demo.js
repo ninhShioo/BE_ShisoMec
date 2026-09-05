@@ -16,7 +16,7 @@ const demoUsers = [
         role: 'staff'
     },
     {
-        fullName: 'Bác sĩ Nguyễn Minh Anh',
+        fullName: 'Nguyễn Minh Anh',
         email: 'dentist@doan1.local',
         password: 'Dentist@123',
         phone: '0900000003',

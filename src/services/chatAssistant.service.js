@@ -36,8 +36,11 @@ const {
 const { createAppointmentFromChat } = require('./chatAppointmentTool.service');
 const { createKnowledgeRetriever, toSourceMetadata } = require('./chatKnowledge.service');
 const { attachQualityTelemetry } = require('./aiQuality.service');
+const { createNotificationsForRoles } = require('./notification.service');
 
 const ASSISTANT_NAME = 'Trợ lý AI Phenikaa Dental';
+
+const getInvoiceDisplayCode = (invoice) => `HD-${invoice?.appointmentId || invoice?.id}`;
 
 const timeToMinutes = (time) => {
     const [hour, minute] = String(time || '00:00').slice(0, 5).split(':').map(Number);
@@ -282,7 +285,11 @@ const getSettings = async () => {
         address: 'Tòa nhà Phenikaa Tower, Hà Đông, Hà Nội',
         openingHours: '08:00 - 20:00',
         mapUrl: '',
-        bookingLeadHours: '24'
+        bookingLeadHours: '24',
+        allowPatientCancellation: 'true',
+        allowPatientReschedule: 'true',
+        cancellationLeadHours: '6',
+        rescheduleLeadHours: '12'
     };
 
     const [rows] = await pool.query(
@@ -309,7 +316,48 @@ const getEarliestBookableDateTime = (leadHours = 24) => {
     return new Date(Date.now() + safeLeadHours * 60 * 60 * 1000);
 };
 
-const getBusyRanges = async (dentistId, date) => {
+const parseBooleanSetting = (value, fallback = false) => {
+    if (value === undefined || value === null) return fallback;
+    return value === true || value === 1 || value === '1' || value === 'true';
+};
+
+const getAppointmentPolicySettings = async () => {
+    const settings = await getSettings();
+    return {
+        allowPatientCancellation: parseBooleanSetting(settings.allowPatientCancellation, true),
+        allowPatientReschedule: parseBooleanSetting(settings.allowPatientReschedule, true),
+        bookingLeadHours: Number.isFinite(Number(settings.bookingLeadHours)) ? Number(settings.bookingLeadHours) : 24,
+        cancellationLeadHours: Number.isFinite(Number(settings.cancellationLeadHours)) ? Number(settings.cancellationLeadHours) : 6,
+        rescheduleLeadHours: Number.isFinite(Number(settings.rescheduleLeadHours)) ? Number(settings.rescheduleLeadHours) : 12
+    };
+};
+
+const normalizeDateValue = (value) => {
+    if (value instanceof Date) return formatDateKey(value);
+    return String(value || '').slice(0, 10);
+};
+
+const buildAppointmentDateTime = (appointmentDate, appointmentTime) => {
+    const date = normalizeDateValue(appointmentDate);
+    const time = String(appointmentTime || '').slice(0, 8);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}(:\d{2})?$/.test(time)) return null;
+
+    const normalizedTime = time.length === 5 ? `${time}:00` : time;
+    const appointmentDateTime = new Date(`${date}T${normalizedTime}`);
+    return Number.isNaN(appointmentDateTime.getTime()) ? null : appointmentDateTime;
+};
+
+const getHoursUntilAppointment = (appointment) => {
+    const appointmentDateTime = buildAppointmentDateTime(appointment.appointmentDate, appointment.appointmentTime);
+    if (!appointmentDateTime) return 0;
+    return (appointmentDateTime.getTime() - Date.now()) / (60 * 60 * 1000);
+};
+
+const getBusyRanges = async (dentistId, date, excludeAppointmentId = null) => {
+    const params = [dentistId, date];
+    const excludeClause = excludeAppointmentId ? 'AND a.id <> ?' : '';
+    if (excludeAppointmentId) params.push(excludeAppointmentId);
+
     const [rows] = await pool.query(
         `SELECT
             a.id,
@@ -321,8 +369,9 @@ const getBusyRanges = async (dentistId, date) => {
          WHERE a.dentistId = ?
            AND a.appointmentDate = ?
            AND a.status NOT IN ("cancelled", "no_show")
+           ${excludeClause}
          GROUP BY a.id, a.appointmentTime`,
-        [dentistId, date]
+        params
     );
 
     return rows.map((row) => {
@@ -638,9 +687,9 @@ const matchDentistFromText = (dentists, text) => {
     return { any: false, dentist: dentist || null };
 };
 
-const getDurationForServices = async (serviceIds) => {
+const getDurationForServices = async (serviceIds, database = pool) => {
     if (!Array.isArray(serviceIds) || serviceIds.length === 0) return 30;
-    const [rows] = await pool.query(
+    const [rows] = await database.query(
         'SELECT COALESCE(SUM(COALESCE(duration, 30)), 0) as totalDuration FROM Services WHERE id IN (?) AND status = "active"',
         [serviceIds]
     );
@@ -655,7 +704,7 @@ const isSlotInTimeWindow = (startMinutes, duration, timeWindow) => {
     return startMinutes >= windowStart && startMinutes + duration <= windowEnd;
 };
 
-const findSlotsForDentistDate = async ({ dentistId, date, serviceIds, limit = 8, timeWindow = null }) => {
+const findSlotsForDentistDate = async ({ dentistId, date, serviceIds, limit = 8, timeWindow = null, excludeAppointmentId = null }) => {
     const duration = await getDurationForServices(serviceIds);
     const settings = await getSettings();
     const earliestBookable = getEarliestBookableDateTime(settings.bookingLeadHours);
@@ -676,7 +725,7 @@ const findSlotsForDentistDate = async ({ dentistId, date, serviceIds, limit = 8,
     );
     if (daysOff.length > 0) return [];
 
-    const busyRanges = await getBusyRanges(dentistId, date);
+    const busyRanges = await getBusyRanges(dentistId, date, excludeAppointmentId);
     const workStart = timeToMinutes(schedule.startTime);
     const workEnd = timeToMinutes(schedule.endTime);
     const breakStart = schedule.breakStart ? timeToMinutes(schedule.breakStart) : null;
@@ -708,6 +757,37 @@ const findDentistForExactSlot = async ({ dentists, date, time, serviceIds }) => 
     return null;
 };
 
+const findAlternativeSlotsForDate = async ({ dentists, date, serviceIds, limit = 5, timeWindow = null, excludeDentistId = null }) => {
+    const results = [];
+
+    for (const dentist of dentists) {
+        if (excludeDentistId && Number(dentist.id) === Number(excludeDentistId)) continue;
+
+        const slots = await findSlotsForDentistDate({
+            dentistId: dentist.id,
+            date,
+            serviceIds,
+            limit,
+            timeWindow
+        });
+
+        slots.forEach((slot) => {
+            results.push({
+                ...slot,
+                dentistName: dentist.fullName
+            });
+        });
+    }
+
+    return results
+        .sort((a, b) => `${a.date}T${a.time}`.localeCompare(`${b.date}T${b.time}`) || String(a.dentistName).localeCompare(String(b.dentistName)))
+        .slice(0, limit);
+};
+
+const formatBookingSlotChoices = (slots) => slots
+    .map((slot, index) => `${index + 1}. ${slot.time}${slot.dentistName ? ` với ${slot.dentistName}` : ''}`)
+    .join('\n');
+
 const formatServicesForQuestion = (services) => (
     services.slice(0, 5).map((service, index) => (
         `${index + 1}. ${service.name}${service.duration ? ` (${service.duration} phút)` : ''}`
@@ -736,7 +816,7 @@ const buildDraftSummary = (draft, services, dentists) => {
         draft.appointmentDate ? `Ngày: ${formatDate(draft.appointmentDate)}` : '',
         draft.timeWindow?.label && !draft.appointmentTime ? `Khung giờ: ${draft.timeWindow.label}` : '',
         draft.appointmentTime ? `Giờ: ${draft.appointmentTime}` : '',
-        dentistName ? `Bác sĩ: ${dentistName}` : ''
+        dentistName ? `Bác sĩ dự kiến: ${dentistName}` : ''
     ].filter(Boolean).join('\n');
 };
 
@@ -861,6 +941,15 @@ const buildBookingResponse = async (message, { patientId, user }) => {
         if (pickedSlot?.time) {
             draft.appointmentTime = pickedSlot.time;
             draft.appointmentTimeSource = 'slot_choice';
+            if (pickedSlot.dentistId) draft.dentistId = Number(pickedSlot.dentistId);
+        }
+    }
+
+    if (!draft.appointmentTime && existingState?.lastPrompt === 'time') {
+        const typedTime = parseRequestedTime(message);
+        if (typedTime) {
+            draft.appointmentTime = typedTime;
+            draft.appointmentTimeSource = 'explicit';
         }
     }
 
@@ -997,6 +1086,7 @@ const buildBookingResponse = async (message, { patientId, user }) => {
     }
 
     if (!draft.appointmentTime) {
+        const selectedDentist = dentists.find((dentist) => Number(dentist.id) === Number(draft.dentistId));
         const slots = await findSlotsForDentistDate({
             dentistId: draft.dentistId,
             date: draft.appointmentDate,
@@ -1004,19 +1094,39 @@ const buildBookingResponse = async (message, { patientId, user }) => {
             limit: 6,
             timeWindow: draft.timeWindow
         });
+        const slotsWithDentist = slots.map((slot) => ({
+            ...slot,
+            dentistName: selectedDentist?.fullName || ''
+        }));
+        const alternativeSlots = slotsWithDentist.length > 0 ? [] : await findAlternativeSlotsForDate({
+            dentists,
+            date: draft.appointmentDate,
+            serviceIds: draft.serviceIds,
+            limit: 6,
+            timeWindow: draft.timeWindow,
+            excludeDentistId: draft.dentistId
+        });
+        const displayedSlots = slotsWithDentist.length > 0 ? slotsWithDentist : alternativeSlots;
         await saveConversationAssistantState(patientId, {
             ...state,
             lastPrompt: 'time',
             lastChoices: {
-                slots: slots.slice(0, 6).map((slot) => ({ time: slot.time, date: slot.date, dentistId: slot.dentistId }))
+                slots: displayedSlots.slice(0, 6).map((slot) => ({
+                    time: slot.time,
+                    date: slot.date,
+                    dentistId: slot.dentistId,
+                    dentistName: slot.dentistName
+                }))
             }
         });
         return {
             message: [
                 'Bạn muốn khám giờ nào?',
-                slots.length
-                    ? `Các giờ còn trống ngày ${formatDate(draft.appointmentDate)}${draft.timeWindow?.label ? ` trong ${draft.timeWindow.label}` : ''}:\n${slots.map((slot, index) => `${index + 1}. ${slot.time}`).join('\n')}\nBạn có thể nhập số thứ tự hoặc giờ cụ thể.`
-                    : `Ngày này hiện chưa thấy giờ trống${draft.timeWindow?.label ? ` trong ${draft.timeWindow.label}` : ''} với bác sĩ đã chọn. Bạn có thể đổi ngày, đổi khung giờ hoặc đổi bác sĩ.`
+                slotsWithDentist.length
+                    ? `Các giờ còn trống ngày ${formatDate(draft.appointmentDate)}${draft.timeWindow?.label ? ` trong ${draft.timeWindow.label}` : ''} với ${selectedDentist?.fullName || 'bác sĩ đã chọn'}:\n${formatBookingSlotChoices(slotsWithDentist)}\nBạn có thể nhập số thứ tự hoặc giờ cụ thể. Bác sĩ chọn trong bước đặt lịch là dự kiến, lễ tân sẽ xác nhận lại.`
+                    : alternativeSlots.length
+                        ? `Bác sĩ đã chọn hiện chưa có giờ phù hợp ngày ${formatDate(draft.appointmentDate)}${draft.timeWindow?.label ? ` trong ${draft.timeWindow.label}` : ''}. Mình gợi ý các slot thay thế cùng ngày:\n${formatBookingSlotChoices(alternativeSlots)}\nBạn có thể nhập số thứ tự để chọn cả bác sĩ và giờ, hoặc nhắn “đổi ngày/đổi bác sĩ”.`
+                        : `Ngày này hiện chưa thấy giờ trống${draft.timeWindow?.label ? ` trong ${draft.timeWindow.label}` : ''} với bác sĩ đã chọn hoặc bác sĩ khác. Bạn có thể đổi ngày, đổi khung giờ hoặc gặp nhân viên để lễ tân kiểm tra thêm.`
             ].join('\n'),
             metadata: { intent: 'booking_collect_time', aiMode: 'local_booking', quickActions: baseActions },
             needsStaff: false,
@@ -1051,7 +1161,7 @@ const buildBookingResponse = async (message, { patientId, user }) => {
     }
 
     try {
-        const { appointmentId } = await createAppointmentFromChat({
+        const { appointmentId, preferredDentistName } = await createAppointmentFromChat({
             actor: user,
             patientId,
             dentistId: draft.dentistId,
@@ -1067,7 +1177,10 @@ const buildBookingResponse = async (message, { patientId, user }) => {
             message: [
                 `Đặt lịch thành công. Mã lịch hẹn: #${appointmentId}.`,
                 buildDraftSummary(draft, services, dentists),
-                'Lịch đang ở trạng thái chờ xác nhận. Lễ tân sẽ kiểm tra và xác nhận trước khi bạn đến.',
+                preferredDentistName
+                    ? `Bác sĩ ${preferredDentistName} là lựa chọn dự kiến theo yêu cầu của bạn. Lễ tân sẽ kiểm tra và có thể điều phối bác sĩ khác nếu phát sinh bận đột xuất.`
+                    : 'Lịch đang ở trạng thái chờ xác nhận. Lễ tân sẽ kiểm tra và xác nhận trước khi bạn đến.',
+                'Lịch đang ở trạng thái chờ xác nhận. Bạn vui lòng chờ phòng khám xác nhận trước khi đến.',
                 'Hotline hỗ trợ: 0869 800 318.'
             ].join('\n'),
             metadata: {
@@ -1083,7 +1196,12 @@ const buildBookingResponse = async (message, { patientId, user }) => {
             priorityReason: ''
         };
     } catch (error) {
-        await saveConversationAssistantState(patientId, state);
+        const failedDraft = {
+            ...draft,
+            appointmentTime: '',
+            appointmentTimeSource: ''
+        };
+        const selectedDentist = dentists.find((dentist) => Number(dentist.id) === Number(draft.dentistId));
         const slots = draft.dentistId && draft.appointmentDate
             ? await findSlotsForDentistDate({
                 dentistId: draft.dentistId,
@@ -1093,13 +1211,56 @@ const buildBookingResponse = async (message, { patientId, user }) => {
                 timeWindow: draft.timeWindow
             })
             : [];
+        const slotsWithDentist = slots.map((slot) => ({
+            ...slot,
+            dentistName: selectedDentist?.fullName || ''
+        }));
+        const alternativeSlots = draft.appointmentDate
+            ? await findAlternativeSlotsForDate({
+                dentists,
+                date: draft.appointmentDate,
+                serviceIds: draft.serviceIds,
+                limit: 5,
+                timeWindow: draft.timeWindow,
+                excludeDentistId: draft.dentistId
+            })
+            : [];
+        const displayedSlots = slotsWithDentist.length > 0 ? slotsWithDentist : alternativeSlots;
+
+        await saveConversationAssistantState(patientId, {
+            ...state,
+            draft: failedDraft,
+            lastPrompt: 'time',
+            lastChoices: {
+                slots: displayedSlots.map((slot) => ({
+                    time: slot.time,
+                    date: slot.date,
+                    dentistId: slot.dentistId,
+                    dentistName: slot.dentistName
+                }))
+            },
+            pendingConfirmation: false
+        });
 
         return {
             message: [
                 `Mình chưa đặt được lịch vì: ${publicBookingError(error)}`,
-                slots.length ? `Bạn có thể chọn một giờ trống khác:\n${slots.map((slot, index) => `${index + 1}. ${slot.time}`).join('\n')}` : 'Bạn có thể đổi ngày, giờ hoặc bác sĩ để mình thử lại.'
+                slotsWithDentist.length
+                    ? `Bạn có thể chọn một giờ trống khác với ${selectedDentist?.fullName || 'bác sĩ đã chọn'}:\n${formatBookingSlotChoices(slotsWithDentist)}`
+                    : alternativeSlots.length
+                        ? `Mình gợi ý slot thay thế cùng ngày ở bác sĩ khác:\n${formatBookingSlotChoices(alternativeSlots)}\nBạn có thể nhập số thứ tự để chọn cả bác sĩ và giờ.`
+                        : 'Bạn có thể đổi ngày, giờ, bác sĩ hoặc nhắn “gặp nhân viên” để lễ tân kiểm tra thêm.'
             ].join('\n'),
-            metadata: { intent: 'booking_failed', aiMode: 'local_booking', quickActions: baseActions },
+            metadata: {
+                intent: 'booking_failed',
+                aiMode: 'local_booking',
+                quickActions: [
+                    action('Đổi ngày', 'message', 'Đổi ngày'),
+                    action('Đổi bác sĩ', 'message', 'Đổi bác sĩ'),
+                    action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ'),
+                    action('Hủy nháp', 'message', 'Hủy đặt lịch')
+                ]
+            },
             needsStaff: false,
             priorityReason: ''
         };
@@ -1156,6 +1317,7 @@ const getPatientInvoices = async (patientId, scope = 'open') => {
     const [rows] = await pool.query(
         `SELECT
             i.id,
+            i.appointmentId,
             i.totalAmount,
             i.paidAmount,
             i.status,
@@ -1168,7 +1330,7 @@ const getPatientInvoices = async (patientId, scope = 'open') => {
          LEFT JOIN InvoiceItems ii ON ii.invoiceId = i.id
          WHERE i.patientId = ?
            ${statusClause}
-         GROUP BY i.id, i.totalAmount, i.paidAmount, i.status, i.paymentMethod, a.appointmentDate
+         GROUP BY i.id, i.appointmentId, i.totalAmount, i.paidAmount, i.status, i.paymentMethod, a.appointmentDate
          ORDER BY i.createdAt DESC
          LIMIT 5`,
         [patientId]
@@ -1226,6 +1388,7 @@ const getPatientFollowUps = async (patientId) => {
             m.diagnosis,
             m.nextAppointmentDate,
             m.nextAppointmentNote,
+            m.dentistId,
             a.appointmentDate,
             a.appointmentTime,
             dentist.fullName as dentistName,
@@ -1238,10 +1401,10 @@ const getPatientFollowUps = async (patientId) => {
          WHERE m.patientId = ?
            AND m.nextAppointmentDate IS NOT NULL
            AND m.nextAppointmentDate >= CURDATE()
-         GROUP BY
+        GROUP BY
             m.id, m.appointmentId, m.diagnosis, m.nextAppointmentDate,
             m.nextAppointmentNote, a.appointmentDate, a.appointmentTime,
-            dentist.fullName
+            m.dentistId, dentist.fullName
          ORDER BY m.nextAppointmentDate ASC
          LIMIT 5`,
         [patientId]
@@ -1283,7 +1446,7 @@ const buildPatientInvoiceText = (invoices) => {
         ...invoices.map((invoice, index) => {
             const outstanding = Number(invoice.outstandingAmount || 0).toLocaleString('vi-VN');
             const total = Number(invoice.totalAmount || 0).toLocaleString('vi-VN');
-            return `${index + 1}. INV-${invoice.id}: còn ${outstanding} đ / tổng ${total} đ`
+            return `${index + 1}. ${getInvoiceDisplayCode(invoice)}: còn ${outstanding} đ / tổng ${total} đ`
                 + `${invoice.itemNames ? `, nội dung: ${invoice.itemNames}` : ''}.`;
         }),
         'Bạn có thể mở tab Hóa đơn để thanh toán VNPay QR hoặc kiểm tra trạng thái thanh toán.'
@@ -1342,7 +1505,7 @@ const buildPatientInvoiceTextByScope = (invoices, scope = 'open') => {
             'Các hóa đơn đã thanh toán của bạn:',
             ...invoices.map((invoice, index) => {
                 const total = Number(invoice.totalAmount || 0).toLocaleString('vi-VN');
-                return `${index + 1}. INV-${invoice.id}: đã thanh toán ${total} đ`
+                return `${index + 1}. ${getInvoiceDisplayCode(invoice)}: đã thanh toán ${total} đ`
                     + `${invoice.itemNames ? `, nội dung: ${invoice.itemNames}` : ''}.`;
             }),
             'Bạn có thể mở tab Hóa đơn để xem chi tiết hoặc in/PDF nếu hệ thống hỗ trợ.'
@@ -1360,7 +1523,7 @@ const buildPatientInvoiceTextByScope = (invoices, scope = 'open') => {
                     : invoice.status === 'partial'
                         ? `còn ${outstanding} đ`
                         : 'chưa thanh toán';
-                return `${index + 1}. INV-${invoice.id}: ${statusText} / tổng ${total} đ`
+                return `${index + 1}. ${getInvoiceDisplayCode(invoice)}: ${statusText} / tổng ${total} đ`
                     + `${invoice.itemNames ? `, nội dung: ${invoice.itemNames}` : ''}.`;
             })
         ].join('\n');
@@ -1371,7 +1534,7 @@ const buildPatientInvoiceTextByScope = (invoices, scope = 'open') => {
         ...invoices.map((invoice, index) => {
             const outstanding = Number(invoice.outstandingAmount || 0).toLocaleString('vi-VN');
             const total = Number(invoice.totalAmount || 0).toLocaleString('vi-VN');
-            return `${index + 1}. INV-${invoice.id}: còn ${outstanding} đ / tổng ${total} đ`
+            return `${index + 1}. ${getInvoiceDisplayCode(invoice)}: còn ${outstanding} đ / tổng ${total} đ`
                 + `${invoice.itemNames ? `, nội dung: ${invoice.itemNames}` : ''}.`;
         }),
         'Bạn có thể mở tab Hóa đơn để thanh toán VNPay QR hoặc kiểm tra trạng thái thanh toán.'
@@ -1418,6 +1581,1019 @@ const buildPatientFollowUpText = (records) => {
         )),
         'Bạn có thể đặt lịch tái khám theo ngày trên, hoặc nhắn mình ngày/giờ mong muốn để hỗ trợ đặt lịch.'
     ].join('\n');
+};
+
+const actionableAppointmentStatusLabels = {
+    pending: 'chờ xác nhận',
+    confirmed: 'đã xác nhận'
+};
+
+const isCancelAppointmentIntentText = (text) => (
+    (hasAny(text, ['huy lich', 'huy hen', 'huy cuoc hen', 'cancel lich'])
+        || (hasAny(text, ['khong den duoc']) && !isRescheduleAppointmentIntentText(text)))
+    && !hasAny(text, ['huy nhap', 'huy dat lich'])
+);
+
+const isRescheduleAppointmentIntentText = (text) => (
+    hasAny(text, ['doi lich', 'doi gio', 'doi ngay', 'doi sang', 'doi khung gio', 'doi hen', 'doi lai lich', 'doi lich hen', 'doi lich kham'])
+);
+
+const isDentistChangeAppointmentIntentText = (text) => (
+    hasAny(text, ['doi bac si', 'doi bsi', 'doi nha si', 'chon bac si khac', 'bac si khac', 'bac si ban dot xuat'])
+);
+
+const isFollowUpBookingIntentText = (text) => (
+    hasAny(text, ['dat tai kham', 'hen tai kham', 'dat lich tai kham', 'tao lich tai kham'])
+);
+
+const isAffirmativeText = (text) => hasAny(text, ['xac nhan', 'dong y', 'ok', 'co', 'dung roi', 'chac chan']);
+const isNegativeText = (text) => hasAny(text, ['khong', 'thoi', 'bo qua', 'huy thao tac']);
+
+const parseAppointmentIdFromText = (message) => {
+    const raw = String(message || '');
+    const explicitMatch = raw.match(/(?:#|lich\s*#?|hen\s*#?)\s*(\d{1,8})/i);
+    if (explicitMatch) return Number(explicitMatch[1]);
+
+    const normalized = normalizeText(raw);
+    const wordsMatch = normalized.match(/\b(?:lich|hen|ma lich)\s*(\d{1,8})\b/);
+    if (wordsMatch) return Number(wordsMatch[1]);
+
+    return 0;
+};
+
+const parseInvoiceAppointmentCode = (message) => {
+    const raw = String(message || '');
+    const match = raw.match(/\bHD\s*-?\s*(\d{1,8})\b/i);
+    return match ? Number(match[1]) : 0;
+};
+
+const formatAppointmentChoiceLine = (appointment, index = null) => {
+    const prefix = index === null ? `#${appointment.id}` : `${index + 1}. #${appointment.id}`;
+    return `${prefix} - ${String(appointment.appointmentTime).slice(0, 5)} ngày ${formatDate(appointment.appointmentDate)}`
+        + `${appointment.dentistName ? ` với ${appointment.dentistName}` : ''}`
+        + `${appointment.serviceNames ? `, dịch vụ: ${appointment.serviceNames}` : ''}`
+        + ` (${actionableAppointmentStatusLabels[appointment.status] || appointment.status}).`;
+};
+
+const formatAppointmentChoices = (appointments) => appointments
+    .map((appointment, index) => formatAppointmentChoiceLine(appointment, index))
+    .join('\n');
+
+const getActionablePatientAppointments = async (patientId) => {
+    const [rows] = await pool.query(
+        `SELECT
+            a.id,
+            a.patientId,
+            a.preferredDentistId,
+            a.dentistId,
+            a.appointmentDate,
+            a.appointmentTime,
+            a.status,
+            dentist.fullName as dentistName,
+            GROUP_CONCAT(s.name ORDER BY s.name SEPARATOR ', ') as serviceNames
+         FROM Appointments a
+         LEFT JOIN Users dentist ON dentist.id = a.dentistId
+         LEFT JOIN Appointment_Services aps ON aps.appointmentId = a.id
+         LEFT JOIN Services s ON s.id = aps.serviceId
+         WHERE a.patientId = ?
+           AND a.status IN ("pending", "confirmed")
+           AND TIMESTAMP(a.appointmentDate, a.appointmentTime) >= NOW()
+         GROUP BY a.id, a.patientId, a.preferredDentistId, a.dentistId, a.appointmentDate, a.appointmentTime, a.status, dentist.fullName
+         ORDER BY a.appointmentDate ASC, a.appointmentTime ASC
+         LIMIT 5`,
+        [patientId]
+    );
+
+    return rows;
+};
+
+const pickAppointmentFromMessage = (message, appointments) => {
+    const explicitId = parseAppointmentIdFromText(message);
+    if (explicitId) return appointments.find((appointment) => Number(appointment.id) === explicitId) || null;
+
+    const choiceNumber = getChoiceNumber(message);
+    if (choiceNumber) {
+        const byChoice = pickNumberedChoice(appointments, choiceNumber);
+        if (byChoice) return byChoice;
+        return appointments.find((appointment) => Number(appointment.id) === choiceNumber) || null;
+    }
+
+    return null;
+};
+
+const getServiceIdsForAppointment = async (appointmentId, database = pool) => {
+    const [rows] = await database.query(
+        'SELECT serviceId FROM Appointment_Services WHERE appointmentId = ? ORDER BY serviceId ASC',
+        [appointmentId]
+    );
+    return rows.map((row) => Number(row.serviceId)).filter(Boolean);
+};
+
+const getPatientInvoiceByAppointmentCode = async (patientId, appointmentId) => {
+    const [rows] = await pool.query(
+        `SELECT
+            i.id,
+            i.appointmentId,
+            i.totalAmount,
+            i.paidAmount,
+            i.status,
+            i.paymentMethod,
+            (i.totalAmount - i.paidAmount) as outstandingAmount,
+            a.appointmentDate,
+            GROUP_CONCAT(ii.description ORDER BY ii.id SEPARATOR ', ') as itemNames
+         FROM Invoices i
+         JOIN Appointments a ON a.id = i.appointmentId
+         LEFT JOIN InvoiceItems ii ON ii.invoiceId = i.id
+         WHERE i.patientId = ?
+           AND i.appointmentId = ?
+           AND i.status <> "cancelled"
+         GROUP BY i.id, i.appointmentId, i.totalAmount, i.paidAmount, i.status, i.paymentMethod, a.appointmentDate
+         LIMIT 1`,
+        [patientId, appointmentId]
+    );
+    return rows[0] || null;
+};
+
+const recordChatAppointmentStatusHistory = async (connection, appointmentId, oldStatus, newStatus, userId, reason = null, note = null) => {
+    await connection.query(
+        `INSERT INTO AppointmentStatusHistory
+         (appointmentId, oldStatus, newStatus, changedBy, reason, note)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [appointmentId, oldStatus || null, newStatus, userId || null, reason || null, note || null]
+    );
+};
+
+const getChatAppointmentBusyRanges = async (connection, columnName, userId, appointmentDate, excludeAppointmentId = null) => {
+    if (!['patientId', 'dentistId'].includes(columnName)) throw new Error('Invalid appointment owner column.');
+
+    const params = [userId, appointmentDate];
+    let excludeClause = '';
+    if (excludeAppointmentId) {
+        excludeClause = 'AND a.id <> ?';
+        params.push(excludeAppointmentId);
+    }
+
+    const [rows] = await connection.query(
+        `SELECT
+            a.id,
+            a.appointmentTime,
+            COALESCE(SUM(COALESCE(s.duration, 30)), 30) as duration
+         FROM Appointments a
+         LEFT JOIN Appointment_Services aps ON aps.appointmentId = a.id
+         LEFT JOIN Services s ON s.id = aps.serviceId
+         WHERE a.${columnName} = ?
+           AND a.appointmentDate = ?
+           AND a.status NOT IN ("cancelled", "no_show")
+           ${excludeClause}
+         GROUP BY a.id, a.appointmentTime`,
+        params
+    );
+
+    return rows.map((row) => {
+        const start = timeToMinutes(row.appointmentTime);
+        return {
+            id: row.id,
+            start,
+            end: start + Math.max(Number(row.duration || 30), 30)
+        };
+    });
+};
+
+const hasChatAppointmentOverlap = async (connection, columnName, userId, appointmentDate, startMinutes, duration, excludeAppointmentId = null) => {
+    const endMinutes = startMinutes + duration;
+    const busyRanges = await getChatAppointmentBusyRanges(connection, columnName, userId, appointmentDate, excludeAppointmentId);
+    return busyRanges.some((range) => rangesOverlap(startMinutes, endMinutes, range.start, range.end));
+};
+
+const validateDentistSlotForChat = async (connection, dentistId, appointmentDate, appointmentTime, duration, excludeAppointmentId = null) => {
+    const date = normalizeDateValue(appointmentDate);
+    const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
+    const [[schedule]] = await connection.query(
+        `SELECT startTime, endTime, breakStart, breakEnd, slotIntervalMinutes, isActive
+         FROM DoctorSchedules
+         WHERE dentistId = ? AND dayOfWeek = ?
+         LIMIT 1`,
+        [dentistId, dayOfWeek]
+    );
+
+    if (!schedule || Number(schedule.isActive) !== 1) return 'Bác sĩ không làm việc trong ngày này.';
+
+    const [daysOff] = await connection.query(
+        'SELECT id FROM DoctorDaysOff WHERE dentistId = ? AND offDate = ? LIMIT 1',
+        [dentistId, date]
+    );
+    if (daysOff.length > 0) return 'Bác sĩ nghỉ trong ngày này.';
+
+    const start = timeToMinutes(appointmentTime);
+    const end = start + duration;
+    const workStart = timeToMinutes(schedule.startTime);
+    const workEnd = timeToMinutes(schedule.endTime);
+    const interval = Number(schedule.slotIntervalMinutes || 30);
+
+    if (start < workStart || end > workEnd) return 'Khung giờ mới nằm ngoài lịch làm việc của bác sĩ.';
+    if ((start - workStart) % interval !== 0) return `Khung giờ phải theo bước ${interval} phút của lịch bác sĩ.`;
+
+    if (schedule.breakStart && schedule.breakEnd) {
+        const breakStart = timeToMinutes(schedule.breakStart);
+        const breakEnd = timeToMinutes(schedule.breakEnd);
+        if (rangesOverlap(start, end, breakStart, breakEnd)) return 'Khung giờ mới bị trùng giờ nghỉ của bác sĩ.';
+    }
+
+    if (await hasChatAppointmentOverlap(connection, 'dentistId', dentistId, date, start, duration, excludeAppointmentId)) {
+        return 'Bác sĩ đã có lịch khác trong khoảng thời gian này.';
+    }
+
+    return null;
+};
+
+const cancelAppointmentFromChat = async ({ patientId, appointmentId, actorId, reason }) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+        const [rows] = await connection.query('SELECT * FROM Appointments WHERE id = ? FOR UPDATE', [appointmentId]);
+        const appointment = rows[0];
+        if (!appointment || Number(appointment.patientId) !== Number(patientId)) throw new Error('Không tìm thấy lịch hẹn thuộc tài khoản của bạn.');
+        if (!['pending', 'confirmed'].includes(appointment.status)) throw new Error('Chỉ có thể hủy lịch đang chờ xác nhận hoặc đã xác nhận.');
+
+        const policy = await getAppointmentPolicySettings();
+        if (!policy.allowPatientCancellation) throw new Error('Phòng khám đang tắt chức năng khách hàng tự hủy lịch.');
+        if (getHoursUntilAppointment(appointment) < policy.cancellationLeadHours) {
+            throw new Error(`Chỉ có thể tự hủy lịch trước giờ hẹn ít nhất ${policy.cancellationLeadHours} giờ.`);
+        }
+
+        await connection.query(
+            `UPDATE Appointments
+             SET status = "cancelled", cancelledAt = NOW(), statusChangedAt = NOW(), cancellationReason = ?, statusNote = ?
+             WHERE id = ?`,
+            [reason || 'Khách hàng hủy lịch qua AI chatbox', 'Khách hàng hủy lịch qua AI chatbox', appointmentId]
+        );
+        await recordChatAppointmentStatusHistory(
+            connection,
+            appointmentId,
+            appointment.status,
+            'cancelled',
+            actorId,
+            reason || 'Khách hàng hủy lịch qua AI chatbox',
+            `AI chatbox hỗ trợ hủy lịch #${appointmentId}`
+        );
+        await createNotificationsForRoles(
+            connection,
+            ['staff', 'admin'],
+            'Khách hàng hủy lịch qua AI',
+            `Khách hàng đã hủy lịch hẹn #${appointmentId} qua Chat AI. Vui lòng kiểm tra nếu cần điều phối lại slot.`,
+            'appointment'
+        );
+
+        await connection.commit();
+        return appointment;
+    } catch (error) {
+        await connection.rollback();
+        throw error;
+    } finally {
+        connection.release();
+    }
+};
+
+const rescheduleAppointmentFromChat = async ({ patientId, appointmentId, appointmentDate, appointmentTime, actorId, reason }) => {
+    const connection = await pool.getConnection();
+    try {
+        const appointmentDateTime = buildAppointmentDateTime(appointmentDate, appointmentTime);
+        if (!appointmentDateTime) throw new Error('Ngày hoặc giờ hẹn mới không hợp lệ.');
+
+        await connection.beginTransaction();
+        const [rows] = await connection.query('SELECT * FROM Appointments WHERE id = ? FOR UPDATE', [appointmentId]);
+        const appointment = rows[0];
+        if (!appointment || Number(appointment.patientId) !== Number(patientId)) throw new Error('Không tìm thấy lịch hẹn thuộc tài khoản của bạn.');
+        if (!['pending', 'confirmed'].includes(appointment.status)) throw new Error('Chỉ có thể đổi lịch đang chờ xác nhận hoặc đã xác nhận.');
+        if (!appointment.dentistId) throw new Error('Lịch này chưa có bác sĩ phụ trách, vui lòng để lễ tân hỗ trợ đổi lịch.');
+
+        const policy = await getAppointmentPolicySettings();
+        if (!policy.allowPatientReschedule) throw new Error('Phòng khám đang tắt chức năng khách hàng tự đổi lịch.');
+        if (getHoursUntilAppointment(appointment) < policy.rescheduleLeadHours) {
+            throw new Error(`Chỉ có thể tự đổi lịch trước giờ hẹn ít nhất ${policy.rescheduleLeadHours} giờ.`);
+        }
+        if (appointmentDateTime < getEarliestBookableDateTime(policy.bookingLeadHours)) {
+            throw new Error(`Cần đặt lịch trước ít nhất ${policy.bookingLeadHours} giờ.`);
+        }
+
+        const serviceIds = await getServiceIdsForAppointment(appointmentId, connection);
+        const duration = await getDurationForServices(serviceIds, connection);
+        const startMinutes = timeToMinutes(appointmentTime);
+
+        if (await hasChatAppointmentOverlap(connection, 'patientId', patientId, appointmentDate, startMinutes, duration, appointmentId)) {
+            throw new Error('Bạn đã có lịch khác trong khoảng thời gian này.');
+        }
+
+        const dentistAvailabilityError = await validateDentistSlotForChat(
+            connection,
+            appointment.dentistId,
+            appointmentDate,
+            appointmentTime,
+            duration,
+            appointmentId
+        );
+        if (dentistAvailabilityError) throw new Error(dentistAvailabilityError);
+
+        await connection.query(
+            `UPDATE Appointments
+             SET appointmentDate = ?, appointmentTime = ?, rescheduledAt = NOW(), rescheduleReason = ?, statusNote = ?
+             WHERE id = ?`,
+            [appointmentDate, appointmentTime, reason || 'Khách hàng đổi lịch qua AI chatbox', 'Khách hàng đổi lịch qua AI chatbox', appointmentId]
+        );
+        await recordChatAppointmentStatusHistory(
+            connection,
+            appointmentId,
+            appointment.status,
+            appointment.status,
+            actorId,
+            reason || 'Khách hàng đổi lịch qua AI chatbox',
+            `Dời từ ${formatDate(appointment.appointmentDate)} ${String(appointment.appointmentTime).slice(0, 5)} sang ${formatDate(appointmentDate)} ${String(appointmentTime).slice(0, 5)} qua AI chatbox`
+        );
+        await createNotificationsForRoles(
+            connection,
+            ['staff', 'admin'],
+            'Khách hàng đổi lịch qua AI',
+            `Khách hàng đã đổi lịch hẹn #${appointmentId} sang ${String(appointmentTime).slice(0, 5)} ngày ${formatDate(appointmentDate)} qua Chat AI.`,
+            'appointment'
+        );
+
+        await connection.commit();
+        return appointment;
+    } catch (error) {
+        await connection.rollback();
+        throw error;
+    } finally {
+        connection.release();
+    }
+};
+
+const requestDentistChangeFromChat = async ({ patientId, appointmentId, newDentistId, actorId, note }) => {
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        const [rows] = await connection.query('SELECT * FROM Appointments WHERE id = ? FOR UPDATE', [appointmentId]);
+        const appointment = rows[0];
+        if (!appointment || Number(appointment.patientId) !== Number(patientId)) throw new Error('Không tìm thấy lịch hẹn thuộc tài khoản của bạn.');
+        if (!['pending', 'confirmed'].includes(appointment.status)) throw new Error('Chỉ có thể yêu cầu đổi bác sĩ cho lịch đang chờ xác nhận hoặc đã xác nhận.');
+        if (Number(appointment.dentistId || 0) === Number(newDentistId)) throw new Error('Bác sĩ này đang là bác sĩ phụ trách hiện tại của lịch hẹn.');
+
+        const [[newDentist]] = await connection.query(
+            'SELECT id, fullName FROM Users WHERE id = ? AND role = "dentist" AND status = "active" LIMIT 1',
+            [newDentistId]
+        );
+        if (!newDentist) throw new Error('Bác sĩ được chọn không tồn tại hoặc đang bị khóa.');
+
+        const [pendingRequests] = await connection.query(
+            'SELECT id FROM DentistChangeRequests WHERE appointmentId = ? AND status = "pending" LIMIT 1',
+            [appointmentId]
+        );
+        if (pendingRequests.length > 0) throw new Error('Lịch hẹn này đã có yêu cầu đổi bác sĩ đang chờ duyệt.');
+
+        const serviceIds = await getServiceIdsForAppointment(appointmentId, connection);
+        const duration = await getDurationForServices(serviceIds, connection);
+        const availabilityError = await validateDentistSlotForChat(
+            connection,
+            newDentistId,
+            appointment.appointmentDate,
+            appointment.appointmentTime,
+            duration,
+            appointmentId
+        );
+        if (availabilityError) throw new Error(availabilityError);
+
+        await connection.query(
+            `INSERT INTO DentistChangeRequests (appointmentId, requestedBy, oldDentistId, newDentistId, note)
+             VALUES (?, ?, ?, ?, ?)`,
+            [appointmentId, actorId || patientId, appointment.dentistId || null, newDentistId, note || 'Khách hàng yêu cầu đổi bác sĩ qua AI chatbox']
+        );
+
+        await recordChatAppointmentStatusHistory(
+            connection,
+            appointmentId,
+            appointment.status,
+            appointment.status,
+            actorId || patientId,
+            'Khách hàng yêu cầu đổi bác sĩ',
+            `Khách hàng yêu cầu đổi sang ${newDentist.fullName} qua AI chatbox. Lý do: ${note || 'Không ghi rõ'}`
+        );
+
+        await createNotificationsForRoles(
+            connection,
+            ['staff', 'admin'],
+            'Khách hàng yêu cầu đổi bác sĩ',
+            `Khách hàng yêu cầu đổi bác sĩ cho lịch hẹn #${appointmentId} sang ${newDentist.fullName}. Lý do: ${note || 'Không ghi rõ'}.`,
+            'appointment'
+        );
+
+        await connection.commit();
+        return { appointment, newDentist };
+    } catch (error) {
+        await connection.rollback();
+        throw error;
+    } finally {
+        connection.release();
+    }
+};
+
+const createActionMetadata = (intent, quickActions = []) => attachQualityTelemetry({
+    intent,
+    confidence: 1,
+    detectedIntents: [intent],
+    matchedSignals: [intent],
+    groundingSources: [{ id: intent, source: 'database_system', title: 'Luồng thao tác lịch hẹn qua Chat AI', category: 'appointment', score: 1 }],
+    groundingConfidence: 1,
+    grounded: true,
+    aiMode: 'local',
+    quickActions
+});
+
+const buildCancelAppointmentResponse = async (message, { patientId, user, dialogueState }) => {
+    const text = normalizeText(message);
+    const inFlow = dialogueState?.mode === 'cancel_appointment';
+    if (!inFlow && !isCancelAppointmentIntentText(text)) return null;
+
+    const appointments = await getActionablePatientAppointments(patientId);
+    if (appointments.length === 0) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: 'Hiện mình chưa thấy lịch đang chờ xác nhận hoặc đã xác nhận để bạn có thể hủy qua chat.',
+            metadata: createActionMetadata('appointment_cancel_empty', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    const selected = dialogueState?.selectedAppointmentId
+        ? appointments.find((appointment) => Number(appointment.id) === Number(dialogueState.selectedAppointmentId))
+        : pickAppointmentFromMessage(message, appointments);
+
+    if (!selected) {
+        await saveConversationAssistantState(patientId, {
+            mode: 'cancel_appointment',
+            lastChoices: { appointments: appointments.map((appointment) => ({ id: appointment.id })) },
+            updatedAt: new Date().toISOString()
+        });
+        return {
+            message: [
+                'Bạn muốn hủy lịch nào?',
+                formatAppointmentChoices(appointments),
+                'Bạn có thể nhập số thứ tự hoặc mã lịch, ví dụ: hủy lịch #68.'
+            ].join('\n'),
+            metadata: createActionMetadata('appointment_cancel_select', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (!dialogueState?.confirming) {
+        await saveConversationAssistantState(patientId, {
+            mode: 'cancel_appointment',
+            selectedAppointmentId: selected.id,
+            confirming: true,
+            updatedAt: new Date().toISOString()
+        });
+        return {
+            message: [
+                `Bạn xác nhận hủy ${formatAppointmentChoiceLine(selected)}?`,
+                'Nếu chắc chắn, nhắn “xác nhận hủy lịch”. Nếu không, nhắn “không hủy”.'
+            ].join('\n'),
+            metadata: createActionMetadata('appointment_cancel_confirm', [
+                action('Xác nhận hủy lịch', 'message', 'Xác nhận hủy lịch'),
+                action('Không hủy', 'message', 'Không hủy')
+            ]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (isNegativeText(text)) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: 'Mình đã bỏ thao tác hủy lịch. Lịch hẹn của bạn vẫn được giữ nguyên.',
+            metadata: createActionMetadata('appointment_cancel_aborted', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (!isAffirmativeText(text) && !isCancelAppointmentIntentText(text)) {
+        return {
+            message: 'Mình cần bạn xác nhận rõ trước khi hủy lịch. Bạn nhắn “xác nhận hủy lịch” hoặc “không hủy” nhé.',
+            metadata: createActionMetadata('appointment_cancel_confirm_waiting', [
+                action('Xác nhận hủy lịch', 'message', 'Xác nhận hủy lịch'),
+                action('Không hủy', 'message', 'Không hủy')
+            ]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    try {
+        await cancelAppointmentFromChat({
+            patientId,
+            appointmentId: selected.id,
+            actorId: user?.id || patientId,
+            reason: 'Khách hàng xác nhận hủy lịch qua AI chatbox'
+        });
+        await clearConversationAssistantState(patientId);
+        return {
+            message: `Mình đã hủy lịch hẹn #${selected.id}. Lễ tân/admin cũng đã nhận thông báo để cập nhật vận hành.`,
+            metadata: createActionMetadata('appointment_cancelled_by_ai', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    } catch (error) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: `Mình chưa hủy được lịch vì: ${publicBookingError(error)} Bạn có thể mở tab Lịch hẹn hoặc nhắn “gặp nhân viên” để lễ tân hỗ trợ.`,
+            metadata: createActionMetadata('appointment_cancel_failed', [
+                action('Mở lịch hẹn', 'route', '/profile?tab=appointments'),
+                action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ')
+            ]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+};
+
+const buildRescheduleAppointmentResponse = async (message, { patientId, user, dialogueState }) => {
+    const text = normalizeText(message);
+    const inFlow = dialogueState?.mode === 'reschedule_appointment';
+    if (!inFlow && !isRescheduleAppointmentIntentText(text)) return null;
+
+    const appointments = await getActionablePatientAppointments(patientId);
+    if (appointments.length === 0) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: 'Hiện mình chưa thấy lịch đang chờ xác nhận hoặc đã xác nhận để bạn có thể đổi qua chat.',
+            metadata: createActionMetadata('appointment_reschedule_empty', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    const selected = dialogueState?.selectedAppointmentId
+        ? appointments.find((appointment) => Number(appointment.id) === Number(dialogueState.selectedAppointmentId))
+        : pickAppointmentFromMessage(message, appointments);
+
+    if (!selected) {
+        await saveConversationAssistantState(patientId, {
+            mode: 'reschedule_appointment',
+            step: 'select_appointment',
+            updatedAt: new Date().toISOString()
+        });
+        return {
+            message: [
+                'Bạn muốn đổi lịch nào?',
+                formatAppointmentChoices(appointments),
+                'Bạn có thể nhập số thứ tự hoặc mã lịch, ví dụ: đổi lịch #68.'
+            ].join('\n'),
+            metadata: createActionMetadata('appointment_reschedule_select', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (
+        inFlow
+        && dialogueState?.lastPrompt === 'time'
+        && hasAny(text, ['doi ngay', 'doi sang ngay khac'])
+        && !parseRequestedDate(message)
+    ) {
+        await saveConversationAssistantState(patientId, {
+            mode: 'reschedule_appointment',
+            selectedAppointmentId: selected.id,
+            lastPrompt: 'date',
+            updatedAt: new Date().toISOString()
+        });
+        return {
+            message: [
+                `Bạn muốn đổi lịch #${selected.id} sang ngày nào?`,
+                'Bạn có thể nhắn dạng 10/07/2026, ngày mai, hoặc 2026-07-10.'
+            ].join('\n'),
+            metadata: createActionMetadata('appointment_reschedule_collect_date', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    const nextDraft = {
+        appointmentId: selected.id,
+        appointmentDate: dialogueState?.appointmentDate || parseRequestedDate(message),
+        appointmentTime: dialogueState?.appointmentTime || ''
+    };
+
+    const explicitTime = parseRequestedTime(message);
+    const choiceNumber = getChoiceNumber(message);
+    if (choiceNumber && dialogueState?.lastPrompt === 'time') {
+        const pickedSlot = pickNumberedChoice(dialogueState?.lastChoices?.slots || [], choiceNumber);
+        if (pickedSlot?.time) nextDraft.appointmentTime = pickedSlot.time;
+    }
+
+    if (!nextDraft.appointmentTime && explicitTime) {
+        nextDraft.appointmentTime = explicitTime;
+    }
+
+    if (!nextDraft.appointmentDate) {
+        await saveConversationAssistantState(patientId, {
+            mode: 'reschedule_appointment',
+            selectedAppointmentId: selected.id,
+            lastPrompt: 'date',
+            updatedAt: new Date().toISOString()
+        });
+        return {
+            message: [
+                `Bạn muốn đổi lịch #${selected.id} sang ngày nào?`,
+                'Bạn có thể nhắn dạng 10/07/2026, ngày mai, hoặc 2026-07-10.'
+            ].join('\n'),
+            metadata: createActionMetadata('appointment_reschedule_collect_date', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    const serviceIds = await getServiceIdsForAppointment(selected.id);
+    if (!nextDraft.appointmentTime) {
+        if (!selected.dentistId) {
+            await clearConversationAssistantState(patientId);
+            return {
+                message: 'Lịch này chưa có bác sĩ phụ trách nên mình chưa thể tự đổi giờ qua chat. Mình sẽ chuyển lễ tân hỗ trợ điều phối bác sĩ và khung giờ phù hợp.',
+                metadata: createActionMetadata('appointment_reschedule_need_staff', [action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ')]),
+                needsStaff: true,
+                priorityReason: `Khách muốn đổi lịch #${selected.id} nhưng lịch chưa có bác sĩ phụ trách.`
+            };
+        }
+
+        const slots = await findSlotsForDentistDate({
+            dentistId: selected.dentistId,
+            date: nextDraft.appointmentDate,
+            serviceIds,
+            limit: 6,
+            excludeAppointmentId: selected.id
+        });
+        const slotsWithDentist = slots.map((slot) => ({ ...slot, dentistName: selected.dentistName || '' }));
+
+        await saveConversationAssistantState(patientId, {
+            mode: 'reschedule_appointment',
+            selectedAppointmentId: selected.id,
+            appointmentDate: nextDraft.appointmentDate,
+            lastPrompt: 'time',
+            lastChoices: { slots: slotsWithDentist },
+            updatedAt: new Date().toISOString()
+        });
+
+        return {
+            message: slotsWithDentist.length
+                ? [
+                    `Các giờ còn trống ngày ${formatDate(nextDraft.appointmentDate)} với ${selected.dentistName || 'bác sĩ phụ trách'}:`,
+                    formatBookingSlotChoices(slotsWithDentist),
+                    'Bạn nhập số thứ tự hoặc giờ cụ thể để mình đổi lịch.'
+                ].join('\n')
+                : [
+                    `Ngày ${formatDate(nextDraft.appointmentDate)} hiện chưa có slot phù hợp với bác sĩ phụ trách của lịch #${selected.id}.`,
+                    'Bạn có thể nhắn “đổi ngày” để chọn ngày khác hoặc “gặp nhân viên” để lễ tân hỗ trợ đổi bác sĩ nếu bác sĩ bận đột xuất.'
+                ].join('\n'),
+            metadata: createActionMetadata('appointment_reschedule_collect_time', [
+                action('Đổi ngày', 'message', 'Đổi ngày'),
+                action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ')
+            ]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (!dialogueState?.confirming) {
+        await saveConversationAssistantState(patientId, {
+            mode: 'reschedule_appointment',
+            selectedAppointmentId: selected.id,
+            appointmentDate: nextDraft.appointmentDate,
+            appointmentTime: nextDraft.appointmentTime,
+            confirming: true,
+            updatedAt: new Date().toISOString()
+        });
+        return {
+            message: [
+                `Bạn xác nhận đổi lịch #${selected.id} sang ${String(nextDraft.appointmentTime).slice(0, 5)} ngày ${formatDate(nextDraft.appointmentDate)}?`,
+                selected.dentistName ? `Bác sĩ phụ trách vẫn là ${selected.dentistName}.` : '',
+                'Nếu đúng, nhắn “xác nhận đổi lịch”. Nếu không, nhắn “không đổi”.'
+            ].filter(Boolean).join('\n'),
+            metadata: createActionMetadata('appointment_reschedule_confirm', [
+                action('Xác nhận đổi lịch', 'message', 'Xác nhận đổi lịch'),
+                action('Không đổi', 'message', 'Không đổi')
+            ]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (isNegativeText(text)) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: 'Mình đã bỏ thao tác đổi lịch. Lịch hẹn của bạn vẫn được giữ nguyên.',
+            metadata: createActionMetadata('appointment_reschedule_aborted', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (!isAffirmativeText(text) && !isRescheduleAppointmentIntentText(text)) {
+        return {
+            message: 'Mình cần bạn xác nhận rõ trước khi đổi lịch. Bạn nhắn “xác nhận đổi lịch” hoặc “không đổi” nhé.',
+            metadata: createActionMetadata('appointment_reschedule_confirm_waiting', [
+                action('Xác nhận đổi lịch', 'message', 'Xác nhận đổi lịch'),
+                action('Không đổi', 'message', 'Không đổi')
+            ]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    try {
+        await rescheduleAppointmentFromChat({
+            patientId,
+            appointmentId: selected.id,
+            appointmentDate: nextDraft.appointmentDate,
+            appointmentTime: nextDraft.appointmentTime,
+            actorId: user?.id || patientId,
+            reason: 'Khách hàng xác nhận đổi lịch qua AI chatbox'
+        });
+        await clearConversationAssistantState(patientId);
+        return {
+            message: `Mình đã đổi lịch hẹn #${selected.id} sang ${String(nextDraft.appointmentTime).slice(0, 5)} ngày ${formatDate(nextDraft.appointmentDate)}. Lễ tân/admin đã nhận thông báo để theo dõi.`,
+            metadata: createActionMetadata('appointment_rescheduled_by_ai', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    } catch (error) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: `Mình chưa đổi được lịch vì: ${publicBookingError(error)} Bạn có thể chọn ngày/giờ khác hoặc nhắn “gặp nhân viên” để lễ tân hỗ trợ.`,
+            metadata: createActionMetadata('appointment_reschedule_failed', [
+                action('Mở lịch hẹn', 'route', '/profile?tab=appointments'),
+                action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ')
+            ]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+};
+
+const buildDentistChangeAppointmentResponse = async (message, { patientId, user, dialogueState }) => {
+    const text = normalizeText(message);
+    const inFlow = dialogueState?.mode === 'dentist_change_appointment';
+    if (!inFlow && !isDentistChangeAppointmentIntentText(text)) return null;
+
+    const appointments = await getActionablePatientAppointments(patientId);
+    if (appointments.length === 0) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: 'Hiện mình chưa thấy lịch đang chờ xác nhận hoặc đã xác nhận để gửi yêu cầu đổi bác sĩ.',
+            metadata: createActionMetadata('dentist_change_empty', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    const selected = dialogueState?.selectedAppointmentId
+        ? appointments.find((appointment) => Number(appointment.id) === Number(dialogueState.selectedAppointmentId))
+        : pickAppointmentFromMessage(message, appointments);
+
+    if (!selected) {
+        await saveConversationAssistantState(patientId, {
+            mode: 'dentist_change_appointment',
+            lastPrompt: 'appointment',
+            updatedAt: new Date().toISOString()
+        });
+        return {
+            message: [
+                'Bạn muốn đổi bác sĩ cho lịch nào?',
+                formatAppointmentChoices(appointments),
+                'Bạn có thể nhập số thứ tự hoặc mã lịch, ví dụ: đổi bác sĩ lịch #68.'
+            ].join('\n'),
+            metadata: createActionMetadata('dentist_change_select_appointment', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    const dentists = await getActiveDentists();
+    const choiceNumber = getChoiceNumber(message);
+    const pickedByNumber = choiceNumber && dialogueState?.lastPrompt === 'dentist'
+        ? pickNumberedChoice(dentists.filter((dentist) => Number(dentist.id) !== Number(selected.dentistId)).slice(0, 5), choiceNumber)
+        : null;
+    const dentistMatch = matchDentistFromText(dentists, message);
+    const selectedDentist = dialogueState?.newDentistId
+        ? dentists.find((dentist) => Number(dentist.id) === Number(dialogueState.newDentistId))
+        : pickedByNumber || dentistMatch.dentist;
+
+    if (!selectedDentist) {
+        const candidates = dentists.filter((dentist) => Number(dentist.id) !== Number(selected.dentistId)).slice(0, 5);
+        await saveConversationAssistantState(patientId, {
+            mode: 'dentist_change_appointment',
+            selectedAppointmentId: selected.id,
+            lastPrompt: 'dentist',
+            updatedAt: new Date().toISOString()
+        });
+        return {
+            message: [
+                `Bạn muốn đổi lịch #${selected.id} sang bác sĩ nào?`,
+                candidates.length ? formatDentistsForQuestion(candidates) : 'Hiện chưa có bác sĩ khác đang hoạt động để chọn.',
+                'Bác sĩ mới sẽ là yêu cầu chờ admin/lễ tân duyệt, không đổi chính thức ngay.'
+            ].join('\n'),
+            metadata: createActionMetadata('dentist_change_select_dentist', [
+                action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ'),
+                action('Mở lịch hẹn', 'route', '/profile?tab=appointments')
+            ]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    const existingReason = dialogueState?.reason || '';
+    const reason = existingReason || (
+        dialogueState?.lastPrompt === 'reason'
+            ? String(message || '').trim().slice(0, 500)
+            : ''
+    );
+
+    if (!reason) {
+        await saveConversationAssistantState(patientId, {
+            mode: 'dentist_change_appointment',
+            selectedAppointmentId: selected.id,
+            newDentistId: selectedDentist.id,
+            lastPrompt: 'reason',
+            updatedAt: new Date().toISOString()
+        });
+        return {
+            message: [
+                `Mình sẽ ghi yêu cầu đổi lịch #${selected.id} sang ${selectedDentist.fullName}.`,
+                'Bạn nhập giúp mình lý do để admin/lễ tân duyệt, ví dụ: bác sĩ bận đột xuất, muốn đổi bác sĩ nữ, hoặc cần bác sĩ chuyên môn khác.'
+            ].join('\n'),
+            metadata: createActionMetadata('dentist_change_collect_reason', [
+                action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ')
+            ]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    try {
+        await requestDentistChangeFromChat({
+            patientId,
+            appointmentId: selected.id,
+            newDentistId: selectedDentist.id,
+            actorId: user?.id || patientId,
+            note: reason
+        });
+        await clearConversationAssistantState(patientId);
+        return {
+            message: [
+                `Mình đã gửi yêu cầu đổi bác sĩ cho lịch #${selected.id} sang ${selectedDentist.fullName}.`,
+                'Lễ tân/admin sẽ kiểm tra và duyệt trước khi cập nhật bác sĩ phụ trách chính thức.'
+            ].join('\n'),
+            metadata: createActionMetadata('dentist_change_requested_by_ai', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    } catch (error) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: `Mình chưa gửi được yêu cầu đổi bác sĩ vì: ${publicBookingError(error)} Bạn có thể chọn bác sĩ khác hoặc nhắn “gặp nhân viên” để lễ tân hỗ trợ.`,
+            metadata: createActionMetadata('dentist_change_failed', [
+                action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ'),
+                action('Mở lịch hẹn', 'route', '/profile?tab=appointments')
+            ]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+};
+
+const buildFollowUpBookingStartResponse = async (message, { patientId }) => {
+    const text = normalizeText(message);
+    if (!isFollowUpBookingIntentText(text)) return null;
+
+    const followUps = await getPatientFollowUps(patientId);
+    if (!followUps.length) {
+        return {
+            message: 'Hiện mình chưa thấy ngày tái khám sắp tới trong hồ sơ của bạn. Bạn vẫn có thể đặt lịch khám mới và ghi chú là tái khám.',
+            metadata: createActionMetadata('followup_booking_empty', [action('Đặt lịch thủ công', 'route', '/book-appointment')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    const record = followUps[0];
+    const serviceIds = await getServiceIdsForAppointment(record.appointmentId);
+    await saveConversationAssistantState(patientId, {
+        mode: 'booking',
+        draft: {
+            serviceIds,
+            appointmentDate: normalizeDateValue(record.nextAppointmentDate),
+            appointmentTime: '',
+            appointmentTimeSource: '',
+            timeWindow: null,
+            dentistId: record.dentistId || null,
+            triageTopicId: '',
+            triageDone: true,
+            notes: `Đặt lịch tái khám theo hồ sơ #${record.id}.${record.nextAppointmentNote ? ` Ghi chú tái khám: ${record.nextAppointmentNote}` : ''}`
+        },
+        lastPrompt: serviceIds.length ? 'time' : 'service',
+        lastChoices: {},
+        pendingConfirmation: false,
+        updatedAt: new Date().toISOString()
+    });
+
+    return {
+        message: [
+            `Mình đã tạo nháp đặt tái khám theo hồ sơ #${record.id}, ngày ${formatDate(record.nextAppointmentDate)}.`,
+            record.dentistName ? `Bác sĩ dự kiến: ${record.dentistName}.` : '',
+            serviceIds.length
+                ? 'Bạn nhắn giúp mình giờ muốn khám, ví dụ “9h” hoặc “buổi chiều”.'
+                : 'Bạn chọn giúp mình dịch vụ tái khám muốn đặt.'
+        ].filter(Boolean).join('\n'),
+        metadata: createActionMetadata('followup_booking_started', [
+            action('Hủy nháp', 'message', 'Hủy đặt lịch'),
+            action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ')
+        ]),
+        needsStaff: false,
+        priorityReason: ''
+    };
+};
+
+const buildAppointmentManagementResponse = async (message, context) => {
+    const patientId = Number(context.patientId || 0);
+    if (!Number.isInteger(patientId) || patientId <= 0) return null;
+
+    const text = normalizeText(message);
+    let dialogueState = context.dialogueState || null;
+    let nextContext = context;
+
+    if (dialogueState?.mode === 'booking') {
+        const explicitExistingAppointmentAction = isCancelAppointmentIntentText(text)
+            || isFollowUpBookingIntentText(text)
+            || (isRescheduleAppointmentIntentText(text) && hasAny(text, ['lich', 'hen', 'lich hen', 'lich kham']))
+            || (isDentistChangeAppointmentIntentText(text) && hasAny(text, ['lich', 'hen', 'phu trach', 'da dat']));
+
+        if (!explicitExistingAppointmentAction) return null;
+
+        await clearConversationAssistantState(patientId);
+        dialogueState = null;
+        nextContext = { ...context, dialogueState: null };
+    }
+
+    if (['cancel_appointment', 'reschedule_appointment', 'dentist_change_appointment'].includes(dialogueState?.mode) && isHumanSupportIntent(text)) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: 'Mình đã dừng thao tác trong chat và chuyển yêu cầu sang lễ tân/admin để hỗ trợ trực tiếp.',
+            metadata: createActionMetadata('appointment_action_handoff', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: true,
+            priorityReason: 'Khách yêu cầu nhân viên hỗ trợ trong luồng hủy/đổi lịch qua AI.'
+        };
+    }
+
+    if (['cancel_appointment', 'reschedule_appointment', 'dentist_change_appointment'].includes(dialogueState?.mode) && hasAny(text, ['huy thao tac', 'bo qua', 'thoi'])) {
+        await clearConversationAssistantState(patientId);
+        return {
+            message: 'Mình đã dừng thao tác hiện tại. Lịch hẹn của bạn chưa bị thay đổi.',
+            metadata: createActionMetadata('appointment_action_aborted', [action('Mở lịch hẹn', 'route', '/profile?tab=appointments')]),
+            needsStaff: false,
+            priorityReason: ''
+        };
+    }
+
+    if (dialogueState?.mode === 'cancel_appointment' && (isRescheduleAppointmentIntentText(text) || isDentistChangeAppointmentIntentText(text))) {
+        await clearConversationAssistantState(patientId);
+        dialogueState = null;
+        nextContext = { ...context, dialogueState: null };
+    }
+
+    if (dialogueState?.mode === 'reschedule_appointment' && (isCancelAppointmentIntentText(text) || isDentistChangeAppointmentIntentText(text))) {
+        await clearConversationAssistantState(patientId);
+        dialogueState = null;
+        nextContext = { ...context, dialogueState: null };
+    }
+
+    if (dialogueState?.mode === 'dentist_change_appointment' && (isCancelAppointmentIntentText(text) || isRescheduleAppointmentIntentText(text))) {
+        await clearConversationAssistantState(patientId);
+        dialogueState = null;
+        nextContext = { ...context, dialogueState: null };
+    }
+
+    if (dialogueState?.mode === 'dentist_change_appointment' || isDentistChangeAppointmentIntentText(text)) {
+        return buildDentistChangeAppointmentResponse(message, nextContext);
+    }
+
+    if (dialogueState?.mode === 'cancel_appointment' || isCancelAppointmentIntentText(text)) {
+        return buildCancelAppointmentResponse(message, nextContext);
+    }
+
+    if (dialogueState?.mode === 'reschedule_appointment' || isRescheduleAppointmentIntentText(text)) {
+        return buildRescheduleAppointmentResponse(message, nextContext);
+    }
+
+    return buildFollowUpBookingStartResponse(message, nextContext);
 };
 
 const buildPatientOverviewText = ({ appointments, invoices, followUps }) => {
@@ -1609,6 +2785,63 @@ const buildFocusedReply = async (message, preloadedKnowledgeResult = null) => {
     };
 };
 
+const assistantToneOpenings = {
+    patient_overview: 'Mình kiểm tra nhanh thông tin của bạn rồi nhé.',
+    patient_followups: 'Mình xem lịch tái khám của bạn như sau.',
+    patient_medical_records: 'Mình tìm thấy hồ sơ khám của bạn như sau.',
+    patient_appointments: 'Mình kiểm tra lịch hẹn của bạn rồi nhé.',
+    patient_invoices: 'Mình kiểm tra hóa đơn của bạn rồi nhé.',
+    patient_invoice_by_code: 'Mình kiểm tra hóa đơn theo mã bạn gửi rồi nhé.',
+    booking: 'Mình sẽ hỗ trợ bạn đặt lịch từng bước nhé.',
+    appointment_booking: 'Mình sẽ hỗ trợ bạn đặt lịch từng bước nhé.',
+    human_support: 'Mình đã ghi nhận để nhân viên hỗ trợ bạn tiếp nhé.'
+};
+
+const hasWarmAssistantOpening = (message) => {
+    const normalized = normalizeText(String(message || '').trim().split('\n')[0] || '');
+    return normalized.startsWith('minh ')
+        || normalized.startsWith('chao ban')
+        || normalized.startsWith('ban ')
+        || normalized.startsWith('da ghi nhan')
+        || normalized.startsWith('phenikaa');
+};
+
+const applyAssistantTone = (message, metadata = {}) => {
+    const trimmed = String(message || '').trim();
+    if (!trimmed) return trimmed;
+
+    const intent = metadata.intent || metadata.resolvedIntent || '';
+    const opening = metadata.needsStaff
+        ? assistantToneOpenings.human_support
+        : assistantToneOpenings[intent] || '';
+    const tonedMessage = opening && !hasWarmAssistantOpening(trimmed)
+        ? `${opening}\n${trimmed}`
+        : trimmed;
+
+    const lines = tonedMessage.split('\n').filter((line) => line.trim());
+    const lastLine = lines[lines.length - 1] || '';
+    const alreadyActionable = /(nhé|ạ|vui lòng|giúp mình|gặp nhân viên|đặt lịch|mở|chọn|nhắn)/iu.test(lastLine);
+    if (lines.length <= 5 && !alreadyActionable) {
+        return `${tonedMessage}\nBạn cần mình hỗ trợ bước tiếp theo thì nhắn thêm nhé.`;
+    }
+
+    return tonedMessage;
+};
+
+const withAssistantTone = (response, metadataOverride = {}) => {
+    if (!response) return response;
+    const metadata = {
+        ...(response.metadata || {}),
+        needsStaff: response.needsStaff,
+        ...metadataOverride
+    };
+
+    return {
+        ...response,
+        message: applyAssistantTone(response.message, metadata)
+    };
+};
+
 const buildAssistantResponse = async (message, context = {}) => {
     const patientId = Number(context.patientId || context.user?.id || 0);
     let effectiveMessage = message;
@@ -1665,6 +2898,40 @@ const buildAssistantResponse = async (message, context = {}) => {
         ? await findKnowledgeMatch(effectiveMessage)
         : null;
 
+    const invoiceAppointmentCode = parseInvoiceAppointmentCode(effectiveMessage);
+    if (invoiceAppointmentCode && patientId > 0) {
+        const invoice = await getPatientInvoiceByAppointmentCode(patientId, invoiceAppointmentCode);
+        return withAssistantTone({
+            message: invoice
+                ? buildPatientInvoiceTextByScope([invoice], 'all')
+                : `Mình chưa thấy hóa đơn ${getInvoiceDisplayCode({ appointmentId: invoiceAppointmentCode })} trong tài khoản của bạn. Bạn kiểm tra lại mã hoặc nhắn “gặp nhân viên” để lễ tân hỗ trợ nhé.`,
+            metadata: attachQualityTelemetry({
+                intent: 'patient_invoice_by_code',
+                confidence: 1,
+                detectedIntents: ['patient_invoice_by_code'],
+                matchedSignals: ['invoice_code'],
+                entities: { invoiceCode: getInvoiceDisplayCode({ appointmentId: invoiceAppointmentCode }), appointmentId: invoiceAppointmentCode },
+                groundingSources: [{ id: 'patient_invoice_by_code', source: 'database', title: 'Hóa đơn theo mã lịch hẹn', category: 'personal', score: 1 }],
+                groundingConfidence: invoice ? 1 : 0,
+                grounded: Boolean(invoice),
+                quickActions: [
+                    action('Mở hóa đơn', 'route', `/profile?tab=invoices&highlightType=appointment&highlightId=${invoiceAppointmentCode}`),
+                    action('Gặp nhân viên', 'message', 'Tôi muốn gặp nhân viên hỗ trợ')
+                ],
+                aiMode: 'local'
+            }),
+            needsStaff: false,
+            priorityReason: ''
+        });
+    }
+
+    const appointmentManagementResponse = await buildAppointmentManagementResponse(effectiveMessage, {
+        patientId,
+        user: context.user || { id: patientId, role: 'patient' },
+        dialogueState
+    });
+    if (appointmentManagementResponse) return withAssistantTone(appointmentManagementResponse);
+
     if (shouldClarifyIntent(intent, {
         isInBookingFlow: dialogueState?.mode === 'booking',
         hasPersonalDataIntent
@@ -1708,7 +2975,7 @@ const buildAssistantResponse = async (message, context = {}) => {
                 groundingConfidence: 1,
                 grounded: true
             });
-            return bookingResponse;
+            return withAssistantTone(bookingResponse, { intent: 'appointment_booking' });
         }
     }
 
@@ -1824,9 +3091,11 @@ const buildAssistantResponse = async (message, context = {}) => {
         metadata.aiMode = 'local_fallback';
     }
 
+    const responseMetadata = attachQualityTelemetry(metadata);
+
     return {
-        message: responseText,
-        metadata: attachQualityTelemetry(metadata),
+        message: applyAssistantTone(responseText, responseMetadata),
+        metadata: responseMetadata,
         needsStaff,
         priorityReason
     };

@@ -50,6 +50,37 @@ async function alterDatabase() {
         });
 
         await connection.query(`
+            ALTER TABLE Appointments
+            ADD COLUMN preferredDentistId INT NULL AFTER patientId;
+        `).catch(err => {
+            if (err.code !== 'ER_DUP_FIELDNAME') throw err;
+            console.log('Column preferredDentistId already exists in Appointments.');
+        });
+
+        await connection.query(`
+            UPDATE Appointments
+            SET preferredDentistId = dentistId
+            WHERE preferredDentistId IS NULL AND dentistId IS NOT NULL;
+        `);
+
+        await connection.query(`
+            ALTER TABLE Appointments
+            ADD INDEX idx_appointments_preferred_dentist (preferredDentistId, appointmentDate);
+        `).catch(err => {
+            if (err.code !== 'ER_DUP_KEYNAME') throw err;
+            console.log('Index idx_appointments_preferred_dentist already exists.');
+        });
+
+        await connection.query(`
+            ALTER TABLE Appointments
+            ADD CONSTRAINT fk_appointments_preferred_dentist
+            FOREIGN KEY (preferredDentistId) REFERENCES Users(id) ON DELETE SET NULL;
+        `).catch(err => {
+            if (err.code !== 'ER_FK_DUP_NAME' && !err.message.includes('Duplicate key name')) throw err;
+            console.log('Foreign key fk_appointments_preferred_dentist already exists.');
+        });
+
+        await connection.query(`
             ALTER TABLE Promotions
             ADD COLUMN name VARCHAR(150) NOT NULL DEFAULT 'Khuyến mãi',
             ADD COLUMN description TEXT,

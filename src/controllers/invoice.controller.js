@@ -74,8 +74,10 @@ const isVnpayConfigured = () => Boolean(process.env.VNPAY_TMN_CODE && process.en
 
 const getClientIp = (req) => {
     const forwardedFor = req.headers['x-forwarded-for'];
-    if (forwardedFor) return String(forwardedFor).split(',')[0].trim();
-    return req.socket?.remoteAddress || req.ip || '127.0.0.1';
+    const rawIp = forwardedFor ? String(forwardedFor).split(',')[0].trim() : (req.socket?.remoteAddress || req.ip || '');
+    if (!rawIp || rawIp === '::1' || rawIp === 'localhost') return '127.0.0.1';
+    if (rawIp.startsWith('::ffff:')) return rawIp.replace('::ffff:', '');
+    return rawIp;
 };
 
 const formatVnpayDate = (date = new Date()) => {
@@ -139,9 +141,11 @@ const parseInvoiceIdFromTxnRef = (txnRef) => {
     return Number.isInteger(normalizedInvoiceId) && normalizedInvoiceId > 0 ? normalizedInvoiceId : null;
 };
 
+const getInvoiceDisplayCode = (invoice) => `HD-${invoice?.appointmentId || invoice?.id}`;
+
 const recordInvoicePayment = async (connection, invoiceId, paymentAmount, paymentMethod, transactionId) => {
     const [invoices] = await connection.query(
-        'SELECT id, patientId, status, totalAmount, paidAmount FROM Invoices WHERE id = ? FOR UPDATE',
+        'SELECT id, appointmentId, patientId, status, totalAmount, paidAmount FROM Invoices WHERE id = ? FOR UPDATE',
         [invoiceId]
     );
 
@@ -201,18 +205,19 @@ const recordInvoicePayment = async (connection, invoiceId, paymentAmount, paymen
 };
 
 const notifyInvoicePayment = async (paymentResult, invoiceId) => {
+    const invoiceCode = getInvoiceDisplayCode(paymentResult.invoice);
     await createNotification(
         pool,
         paymentResult.invoice.patientId,
         paymentResult.status === 'paid' ? 'Thanh toán thành công' : 'Hóa đơn đã được thanh toán một phần',
-        `Hóa đơn #${invoiceId} đã ghi nhận thanh toán ${paymentResult.amount.toLocaleString('vi-VN')} đ.`,
+        `Hóa đơn ${invoiceCode} đã ghi nhận thanh toán ${paymentResult.amount.toLocaleString('vi-VN')} đ.`,
         'payment'
     );
     await createNotificationsForRoles(
         pool,
         ['admin', 'staff'],
         paymentResult.status === 'paid' ? 'Hóa đơn đã thanh toán đủ' : 'Hóa đơn thanh toán một phần',
-        `Hóa đơn #${invoiceId} đã ghi nhận thanh toán ${paymentResult.amount.toLocaleString('vi-VN')} đ.`,
+        `Hóa đơn ${invoiceCode} đã ghi nhận thanh toán ${paymentResult.amount.toLocaleString('vi-VN')} đ.`,
         'payment'
     );
 };
@@ -261,6 +266,8 @@ const confirmVnpayPaymentFromParams = async (params) => {
                 ...result,
                 success: true,
                 status: 'success',
+                appointmentId: paymentResult.invoice.appointmentId,
+                invoiceCode: getInvoiceDisplayCode(paymentResult.invoice),
                 message: 'Đã ghi nhận thanh toán VNPay.',
                 payment: paymentResult
             };
@@ -272,6 +279,8 @@ const confirmVnpayPaymentFromParams = async (params) => {
                 ...result,
                 success: true,
                 status: 'success',
+                appointmentId: paymentResult.invoice?.appointmentId,
+                invoiceCode: getInvoiceDisplayCode(paymentResult.invoice),
                 message: 'Giao dịch VNPay đã được ghi nhận trước đó.'
             };
         }
@@ -341,7 +350,9 @@ const getInvoicePayments = async (connectionOrPool, invoiceIds) => {
 };
 
 const mapInvoice = (invoice, itemsByInvoice, paymentsByInvoice) => {
-    const subtotalAmount = money(invoice.subtotalAmount || invoice.totalAmount);
+    const items = itemsByInvoice.get(invoice.id) || [];
+    const itemsSubtotal = items.reduce((sum, item) => sum + money(item.totalPrice), 0);
+    const subtotalAmount = money(invoice.subtotalAmount) || itemsSubtotal || money(invoice.totalAmount) + money(invoice.discountAmount);
     const discountAmount = money(invoice.discountAmount);
     const paidAmount = money(invoice.paidAmount);
     const totalAmount = money(invoice.totalAmount);
@@ -353,7 +364,7 @@ const mapInvoice = (invoice, itemsByInvoice, paymentsByInvoice) => {
         paidAmount,
         totalAmount,
         outstandingAmount: Math.max(totalAmount - paidAmount, 0),
-        items: itemsByInvoice.get(invoice.id) || [],
+        items,
         payments: paymentsByInvoice.get(invoice.id) || []
     };
 };
@@ -367,7 +378,13 @@ const invoiceController = {
             const appointmentId = Number(requestBody.appointmentId);
             const invoicePaymentMethod = requestBody.paymentMethod || 'cash';
             const discountAmount = money(requestBody.discountAmount);
-            const promotionId = requestBody.promotionId === undefined || requestBody.promotionId === '' ? null : Number(requestBody.promotionId);
+            const rawPromotionId = requestBody.promotionId;
+            const promotionId = rawPromotionId === undefined
+                || rawPromotionId === null
+                || rawPromotionId === ''
+                || rawPromotionId === 'null'
+                ? null
+                : Number(rawPromotionId);
             const note = requestBody.note ? String(requestBody.note).trim() : null;
 
             if (!Number.isInteger(appointmentId) || appointmentId <= 0) {
@@ -476,7 +493,7 @@ const invoiceController = {
                 pool,
                 appointment.patientId,
                 'Hóa đơn mới',
-                `Hóa đơn #${invoiceId} đã được tạo cho lịch hẹn #${appointmentId}.`,
+                `Hóa đơn ${getInvoiceDisplayCode({ id: invoiceId, appointmentId })} đã được tạo cho lịch hẹn #${appointmentId}.`,
                 'payment'
             );
 
@@ -702,6 +719,8 @@ const invoiceController = {
             payment: confirmation.status,
             method: 'vnpay',
             invoiceId: confirmation.invoiceId ? String(confirmation.invoiceId) : '',
+            appointmentId: confirmation.appointmentId ? String(confirmation.appointmentId) : '',
+            invoiceCode: confirmation.invoiceCode || '',
             responseCode: String(req.query.vnp_ResponseCode || '')
         });
 
@@ -716,6 +735,8 @@ const invoiceController = {
             data: {
                 status: confirmation.status,
                 invoiceId: confirmation.invoiceId,
+                appointmentId: confirmation.appointmentId,
+                invoiceCode: confirmation.invoiceCode,
                 responseCode: confirmation.responseCode
             }
         });
@@ -771,7 +792,13 @@ const invoiceController = {
         try {
             const invoiceId = Number(req.params.id);
             const requestBody = req.body || {};
-            const promotionId = requestBody.promotionId === undefined || requestBody.promotionId === '' ? null : Number(requestBody.promotionId);
+            const rawPromotionId = requestBody.promotionId;
+            const promotionId = rawPromotionId === undefined
+                || rawPromotionId === null
+                || rawPromotionId === ''
+                || rawPromotionId === 'null'
+                ? null
+                : Number(rawPromotionId);
 
             if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
                 return res.status(400).json({ success: false, message: 'ID hóa đơn không hợp lệ.' });
@@ -784,7 +811,7 @@ const invoiceController = {
             await connection.beginTransaction();
 
             const [invoices] = await connection.query(
-                'SELECT id, patientId, status, subtotalAmount, totalAmount, paidAmount FROM Invoices WHERE id = ? FOR UPDATE',
+                'SELECT id, patientId, status, subtotalAmount, discountAmount, totalAmount, paidAmount FROM Invoices WHERE id = ? FOR UPDATE',
                 [invoiceId]
             );
 
@@ -804,7 +831,13 @@ const invoiceController = {
                 return res.status(400).json({ success: false, message: 'Không thể áp voucher cho hóa đơn đã hủy.' });
             }
 
-            const subtotalAmount = money(invoice.subtotalAmount || invoice.totalAmount);
+            const [[itemTotals]] = await connection.query(
+                'SELECT COALESCE(SUM(totalPrice), 0) as itemSubtotal FROM InvoiceItems WHERE invoiceId = ?',
+                [invoiceId]
+            );
+            const subtotalAmount = money(invoice.subtotalAmount)
+                || money(itemTotals?.itemSubtotal)
+                || money(invoice.totalAmount) + money(invoice.discountAmount);
             const promotion = promotionId ? await getActivePromotion(connection, promotionId) : null;
             if (promotionId && !promotion) {
                 await connection.rollback();

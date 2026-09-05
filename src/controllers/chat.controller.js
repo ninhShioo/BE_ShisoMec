@@ -128,6 +128,48 @@ const chatController = {
         }
     },
 
+    clearChatHistory: async (req, res, next) => {
+        const connection = await pool.getConnection();
+
+        try {
+            if (req.user.role !== 'patient') {
+                return res.status(403).json({ success: false, message: 'Chỉ khách hàng được tự xóa lịch sử chat của mình.' });
+            }
+
+            await connection.beginTransaction();
+
+            await connection.query(
+                'DELETE FROM ChatMessages WHERE senderId = ? OR receiverId = ?',
+                [req.user.id, req.user.id]
+            );
+
+            await connection.query(
+                `UPDATE ChatConversations
+                 SET assignedTo = NULL,
+                     status = "new",
+                     needsStaff = 0,
+                     priorityReason = NULL,
+                     assistantState = NULL,
+                     closedAt = NULL,
+                     updatedAt = CURRENT_TIMESTAMP
+                 WHERE patientId = ?`,
+                [req.user.id]
+            );
+
+            await connection.commit();
+
+            res.json({
+                success: true,
+                message: 'Đã xóa lịch sử chat.'
+            });
+        } catch (error) {
+            await connection.rollback();
+            next(error);
+        } finally {
+            connection.release();
+        }
+    },
+
     submitMessageFeedback: async (req, res, next) => {
         const connection = await pool.getConnection();
 

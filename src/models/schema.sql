@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS Services (
 CREATE TABLE IF NOT EXISTS Appointments (
     id INT AUTO_INCREMENT PRIMARY KEY,
     patientId INT NOT NULL,
+    preferredDentistId INT,
     dentistId INT,
     appointmentDate DATE NOT NULL,
     appointmentTime TIME NOT NULL,
@@ -101,8 +102,10 @@ CREATE TABLE IF NOT EXISTS Appointments (
     createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (patientId) REFERENCES Users(id) ON DELETE CASCADE,
+    FOREIGN KEY (preferredDentistId) REFERENCES Users(id) ON DELETE SET NULL,
     FOREIGN KEY (dentistId) REFERENCES Users(id) ON DELETE SET NULL,
     INDEX idx_appointments_patient_slot (patientId, appointmentDate, appointmentTime),
+    INDEX idx_appointments_preferred_dentist (preferredDentistId, appointmentDate),
     INDEX idx_appointments_dentist_slot (dentistId, appointmentDate, appointmentTime),
     INDEX idx_appointments_status_date (status, appointmentDate)
 );

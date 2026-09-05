@@ -285,6 +285,7 @@ const runCompatibilityMigrations = async (connection) => {
     await addColumnIfMissing(connection, 'Promotions', 'description', 'TEXT');
     await addColumnIfMissing(connection, 'Promotions', 'isActive', 'TINYINT(1) DEFAULT 1');
     await addColumnIfMissing(connection, 'Appointments', 'confirmationReminderSentAt', 'TIMESTAMP NULL');
+    await addColumnIfMissing(connection, 'Appointments', 'preferredDentistId', 'INT NULL AFTER patientId');
     await addColumnIfMissing(connection, 'Appointments', 'appointmentReminderEmailSentAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'Appointments', 'appointmentReminderZaloSentAt', 'TIMESTAMP NULL');
     await addColumnIfMissing(connection, 'Appointments', 'statusChangedAt', 'TIMESTAMP NULL');
@@ -345,9 +346,34 @@ const runCompatibilityMigrations = async (connection) => {
     await addIndexIfMissing(
         connection,
         'Appointments',
+        'idx_appointments_preferred_dentist',
+        'INDEX idx_appointments_preferred_dentist (preferredDentistId, appointmentDate)'
+    );
+    await addIndexIfMissing(
+        connection,
+        'Appointments',
         'idx_appointments_status_date',
         'INDEX idx_appointments_status_date (status, appointmentDate)'
     );
+    await connection.query(`
+        UPDATE Appointments
+        SET preferredDentistId = dentistId
+        WHERE preferredDentistId IS NULL AND dentistId IS NOT NULL
+    `);
+    await connection.query(`
+        UPDATE Users
+        SET fullName = 'Nguyễn Minh Anh'
+        WHERE role = 'dentist'
+          AND email = 'dentist@doan1.local'
+          AND fullName IN ('Bác sĩ Nguyễn Minh Anh', 'Nguyên Minh Anh', 'Nguyễn Minh Anh')
+    `);
+    await addForeignKeyIfMissing(
+        connection,
+        'fk_appointments_preferred_dentist',
+        'ALTER TABLE Appointments ADD CONSTRAINT fk_appointments_preferred_dentist FOREIGN KEY (preferredDentistId) REFERENCES Users(id) ON DELETE SET NULL'
+    ).catch((error) => {
+        console.warn(`Skipped fk_appointments_preferred_dentist: ${error.message}`);
+    });
     await addIndexIfMissing(
         connection,
         'Promotions',
