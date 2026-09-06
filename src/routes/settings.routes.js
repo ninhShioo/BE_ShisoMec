@@ -6,9 +6,9 @@ const logActivity = require('../middlewares/activityLogger');
 
 router.get('/public', settingsController.getPublicSettings);
 
-router.use(verifyToken, checkRole(['admin']));
+router.use(verifyToken);
 
-router.get('/', settingsController.getSettings);
-router.put('/', logActivity('UPDATE_SETTINGS', 'Settings'), settingsController.updateSettings);
+router.get('/', checkRole(['admin', 'staff', 'dentist']), settingsController.getSettings);
+router.put('/', checkRole(['admin']), logActivity('UPDATE_SETTINGS', 'Settings'), settingsController.updateSettings);
 
 module.exports = router;

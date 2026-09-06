@@ -1182,7 +1182,7 @@ const appointmentController = {
             if (req.user.role === 'staff' && appt.status === 'confirmed') {
                 const requestNote = String(note || '').trim();
                 if (!requestNote) {
-                    return res.status(400).json({ success: false, message: 'Vui lòng nhập lý do đổi bác sĩ để admin duyệt.' });
+                    return res.status(400).json({ success: false, message: 'Vui lòng nhập lý do đổi bác sĩ để admin xác nhận.' });
                 }
 
                 const [pendingRequests] = await pool.query(
@@ -1190,7 +1190,7 @@ const appointmentController = {
                     [id]
                 );
                 if (pendingRequests.length > 0) {
-                    return res.status(409).json({ success: false, message: 'Lịch hẹn này đã có yêu cầu đổi bác sĩ đang chờ duyệt.' });
+                    return res.status(409).json({ success: false, message: 'Lịch hẹn này đã có yêu cầu đổi bác sĩ đang chờ xác nhận.' });
                 }
 
                 const [requestResult] = await pool.query(
@@ -1212,7 +1212,7 @@ const appointmentController = {
 
                 return res.status(202).json({
                     success: true,
-                    message: 'Đã gửi yêu cầu đổi bác sĩ, chờ admin duyệt.',
+                    message: 'Đã gửi yêu cầu đổi bác sĩ, chờ admin xác nhận.',
                     data: { requestId: requestResult.insertId }
                 });
             }
@@ -1507,9 +1507,9 @@ const appointmentController = {
             }
 
             if (status === 'approved') {
-                if (request.appointmentStatus !== 'confirmed') {
+                if (!['pending', 'confirmed'].includes(request.appointmentStatus)) {
                     await connection.rollback();
-                    return res.status(400).json({ success: false, message: 'Chỉ duyệt đổi bác sĩ cho lịch đã xác nhận.' });
+                    return res.status(400).json({ success: false, message: 'Chỉ xác nhận đổi bác sĩ cho lịch đang chờ xác nhận hoặc đã xác nhận.' });
                 }
 
                 const [serviceRows] = await connection.query(
@@ -1541,7 +1541,7 @@ const appointmentController = {
                     request.appointmentStatus,
                     request.appointmentStatus,
                     req.user.id,
-                    'Duyệt đổi bác sĩ phụ trách',
+                    'Xác nhận đổi bác sĩ phụ trách',
                     `Bác sĩ phụ trách: ${describeDentistChange(request.oldDentistName, request.newDentistName)}.${request.note ? ` Lý do: ${request.note}` : ''}`
                 );
             }
@@ -1554,8 +1554,8 @@ const appointmentController = {
             await createNotification(
                 connection,
                 request.requestedBy,
-                status === 'approved' ? 'Yêu cầu đổi bác sĩ đã được duyệt' : 'Yêu cầu đổi bác sĩ bị từ chối',
-                `Yêu cầu đổi bác sĩ cho lịch hẹn #${request.appointmentId} đã được ${status === 'approved' ? 'duyệt' : 'từ chối'}.`,
+                status === 'approved' ? 'Yêu cầu đổi bác sĩ đã được xác nhận' : 'Yêu cầu đổi bác sĩ bị từ chối',
+                `Yêu cầu đổi bác sĩ cho lịch hẹn #${request.appointmentId} đã được ${status === 'approved' ? 'xác nhận' : 'từ chối'}.`,
                 'appointment'
             );
 
@@ -1590,13 +1590,13 @@ const appointmentController = {
             await createNotificationsForRoles(
                 connection,
                 ['staff'],
-                status === 'approved' ? 'Admin đã duyệt đổi bác sĩ' : 'Admin từ chối đổi bác sĩ',
-                `Yêu cầu đổi bác sĩ cho lịch hẹn #${request.appointmentId} đã được ${status === 'approved' ? 'duyệt' : 'từ chối'}.`,
+                status === 'approved' ? 'Admin đã xác nhận đổi bác sĩ' : 'Admin từ chối đổi bác sĩ',
+                `Yêu cầu đổi bác sĩ cho lịch hẹn #${request.appointmentId} đã được ${status === 'approved' ? 'xác nhận' : 'từ chối'}.`,
                 'appointment'
             );
 
             await connection.commit();
-            res.json({ success: true, message: 'Đã xử lý yêu cầu đổi bác sĩ.' });
+            res.json({ success: true, message: status === 'approved' ? 'Đã xác nhận đổi bác sĩ.' : 'Đã từ chối yêu cầu đổi bác sĩ.' });
         } catch (error) {
             await connection.rollback();
             next(error);
