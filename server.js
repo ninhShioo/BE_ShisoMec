@@ -18,6 +18,8 @@ const app = express();
 const corsOrigins = getCorsOrigins();
 const rateLimitConfig = getRateLimitConfig();
 
+app.set('trust proxy', 1);
+
 app.use(helmet());
 app.use(cors({
     origin: corsOrigins,
